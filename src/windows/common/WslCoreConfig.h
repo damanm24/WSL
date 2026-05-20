@@ -289,6 +289,7 @@ namespace ConfigSetting {
         static constexpr auto IgnoredPorts = "experimental.ignoredPorts";
         static constexpr auto HostAddressLoopback = "experimental.hostAddressLoopback";
         static constexpr auto SetVersionDebug = "experimental.setVersionDebug";
+        static constexpr auto OpenVmm = "experimental.openVmm";
 
     } // namespace Experimental
 } // namespace ConfigSetting
@@ -378,6 +379,9 @@ struct Config
 
     // Temporary config value to help root cause the truncated archive errors in SetVersion()
     bool SetVersionDebug = false;
+
+    // Use OpenVMM instead of HCS as the VMM backend.
+    bool UseOpenVmm = false;
 
     GUID NatNetworkId() const noexcept;
     LPCWSTR NatNetworkName() const noexcept;

@@ -21,6 +21,7 @@ set(SOURCES
     WslCoreTcpIpStateTracking.cpp
     WslCoreVm.cpp
     HcsVirtualMachine.cpp
+    HcsWslVmBackend.cpp
     WSLCSessionManager.cpp
     WSLCSessionManagerFactory.cpp
     main.rc
@@ -52,6 +53,8 @@ set(HEADERS
     WslCoreTcpIpStateTracking.h
     WslCoreVm.h
     HcsVirtualMachine.h
+    IWslVmBackend.h
+    HcsWslVmBackend.h
     WSLCSessionManager.h
     WSLCSessionManagerFactory.h)
 
@@ -61,10 +64,12 @@ set(WSLSERVICE_ADDITIONAL_LIBRARIES)
 if (INCLUDE_OPENVMM)
     list(APPEND SOURCES
          OpenVmmVirtualMachine.cpp
+         OpenVmmWslVmBackend.cpp
          TtrpcEnvelopeCodec.cpp
          TtrpcClient.cpp)
     list(APPEND HEADERS
          OpenVmmVirtualMachine.h
+         OpenVmmWslVmBackend.h
          TtrpcEnvelopeCodec.h
          TtrpcClient.h)
 

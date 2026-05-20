@@ -14,6 +14,10 @@ Abstract:
 
 #include "precomp.h"
 #include "WslCoreVm.h"
+#include "HcsWslVmBackend.h"
+#if WSL_INCLUDE_OPENVMM
+#include "OpenVmmWslVmBackend.h"
+#endif
 #include "WslCoreNetworkingSupport.h"
 #include <lxfsshares.h>
 #include "disk.hpp"
@@ -314,64 +318,66 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
 
     // Create the utility VM and store the runtime ID.
     std::wstring json = GenerateConfigJson();
-    m_system = wsl::windows::common::hcs::CreateComputeSystem(m_machineId.c_str(), json.c_str());
-    m_runtimeId = wsl::windows::common::hcs::GetRuntimeId(m_system.get());
+#if WSL_INCLUDE_OPENVMM
+    if (m_vmConfig.UseOpenVmm)
+    {
+        m_backend = std::make_unique<OpenVmmWslVmBackend>();
+    }
+    else
+#endif
+    {
+        m_backend = std::make_unique<HcsWslVmBackend>();
+    }
+
+    m_backend->CreateAndStart(
+        IWslVmBackend::CreateParams{VmId, m_machineId, m_userToken, m_windowsVersion}, json.c_str());
+    m_runtimeId = m_backend->GetRuntimeId();
     WI_ASSERT(IsEqualGUID(VmId, m_runtimeId));
 
     // Initialize the guest device manager.
-    m_guestDeviceManager = std::make_shared<GuestDeviceManager>(m_machineId, m_runtimeId);
+    m_guestDeviceManager = m_backend->GetGuestDeviceManager();
 
     // Create a socket listening for connections from mini_init.
-    m_listenSocket = wsl::windows::common::hvsocket::Listen(m_runtimeId, LX_INIT_UTILITY_VM_INIT_PORT);
+    m_listenSocket = m_backend->ListenForGuestConnection(LX_INIT_UTILITY_VM_INIT_PORT);
 
     if (m_vmConfig.MaxCrashDumpCount >= 0)
     {
-        auto crashDumpSocket = wsl::windows::common::hvsocket::Listen(m_runtimeId, LX_INIT_UTILITY_VM_CRASH_DUMP_PORT);
+        auto crashDumpSocket = m_backend->ListenForGuestConnection(LX_INIT_UTILITY_VM_CRASH_DUMP_PORT);
         THROW_LAST_ERROR_IF(!crashDumpSocket);
         m_crashDumpCollectionThread =
             std::thread{[this, socket = std::move(crashDumpSocket)]() mutable { CollectCrashDumps(std::move(socket)); }};
     }
 
     // Register a callback to detect if the utility VM exits unexpectedly.
-    wsl::windows::common::hcs::RegisterCallback(m_system.get(), s_OnExit, this);
-    signalEarlyTermination.release();
+#if WSL_INCLUDE_OPENVMM
+    if (m_vmConfig.UseOpenVmm)
+    {
+        // For OpenVMM, use the backend's exit callback mechanism.
+        m_backend->RegisterExitCallback([this](std::wstring details) { OnExit(details.c_str()); });
+    }
+    else
+#endif
+    {
+        // For HCS, register directly on the HCS system for crash event handling.
+        wsl::windows::common::hcs::RegisterCallback(
+            static_cast<HcsWslVmBackend*>(m_backend.get())->GetSystem(), s_OnExit, this);
+    }
 
-    // Start the utility VM.
-    try
-    {
-        wsl::windows::common::hcs::StartComputeSystem(m_system.get(), json.c_str());
-    }
-    catch (...)
-    {
-        // Reset m_system so we don't try to wait for termination in the destructor, since the VM isn't even running.
-        m_system.reset();
-        throw;
-    }
+    signalEarlyTermination.release();
 
     // Add GPUs to the utility VM.
     if (m_vmConfig.EnableGpuSupport)
     {
         ExecutionContext context(Context::ConfigureGpu);
 
-        hcs::ModifySettingRequest<hcs::GpuConfiguration> gpuRequest{};
-        gpuRequest.ResourcePath = L"VirtualMachine/ComputeTopology/Gpu";
-        gpuRequest.RequestType = hcs::ModifyRequestType::Update;
-        gpuRequest.Settings.AssignmentMode = hcs::GpuAssignmentMode::Mirror;
-        gpuRequest.Settings.AllowVendorExtension = true;
-        if (wsl::windows::common::hcs::IsDisableVgpuSettingsSupported())
-        {
-            gpuRequest.Settings.DisableGdiAcceleration = true;
-            gpuRequest.Settings.DisablePresentation = true;
-        }
-
-        wsl::windows::common::hcs::ModifyComputeSystem(m_system.get(), wsl::shared::ToJsonW(gpuRequest).c_str());
+        m_backend->AddGpu();
 
         // Also add 9p shares for the library directories.
         // N.B. These are not hosted by the out-of-proc drvfs 9p server because the GPU shares
         //      should work even if drvfs is disabled.
         auto addShare = [&](PCWSTR name, PCWSTR path) {
             constexpr auto flags = (hcs::Plan9ShareFlags::ReadOnly | hcs::Plan9ShareFlags::AllowOptions);
-            wsl::windows::common::hcs::AddPlan9Share(m_system.get(), name, name, path, LX_INIT_UTILITY_VM_PLAN9_PORT, flags);
+            m_backend->AddPlan9Share(name, name, path, LX_INIT_UTILITY_VM_PLAN9_PORT, flags);
         };
 
         std::wstring path;
@@ -557,36 +563,15 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
 
         // Create and initialize the networking engine.
         const auto result = wil::ResultFromException(WI_DIAGNOSTICS_INFO, [&] {
-            if (m_vmConfig.NetworkingMode == NetworkingMode::Mirrored)
-            {
-                m_networkingEngine = std::make_unique<wsl::core::MirroredNetworking>(
-                    m_system.get(), std::move(gnsChannel), m_vmConfig, m_runtimeId, std::move(dnsTunnelingSocket));
-            }
-            else if (m_vmConfig.NetworkingMode == NetworkingMode::Nat)
-            {
-                WI_ASSERT(natNetwork);
-
-                m_networkingEngine = std::make_unique<wsl::core::NatNetworking>(
-                    m_system.get(), std::move(natNetwork), std::move(gnsChannel), m_vmConfig, std::move(dnsTunnelingSocket));
-            }
-            else if (m_vmConfig.NetworkingMode == NetworkingMode::VirtioProxy)
-            {
-                wsl::core::VirtioNetworkingFlags flags = wsl::core::VirtioNetworkingFlags::Ipv6;
-                WI_SetFlagIf(flags, wsl::core::VirtioNetworkingFlags::LocalhostRelay, m_vmConfig.EnableLocalhostRelay);
-                WI_SetFlagIf(flags, wsl::core::VirtioNetworkingFlags::DnsTunneling, m_vmConfig.EnableDnsTunneling);
-                // NAT may have fallen back to virtio proxy after the early-config message; drop the unused DNS hvsocket.
-                dnsTunnelingSocket.reset();
-                m_networkingEngine = std::make_unique<wsl::core::VirtioNetworking>(
-                    std::move(gnsChannel), flags, LX_INIT_RESOLVCONF_FULL_HEADER, m_guestDeviceManager, m_userToken);
-            }
-            else if (m_vmConfig.NetworkingMode == NetworkingMode::Bridged)
-            {
-                m_networkingEngine = std::make_unique<wsl::core::BridgedNetworking>(m_system.get(), m_vmConfig);
-            }
-            else
-            {
-                WI_ASSERT(m_vmConfig.NetworkingMode == NetworkingMode::None);
-            }
+            m_networkingEngine = m_backend->CreateNetworkingEngine(
+                m_vmConfig.NetworkingMode,
+                std::move(gnsChannel),
+                m_vmConfig,
+                m_runtimeId,
+                std::move(dnsTunnelingSocket),
+                m_guestDeviceManager,
+                m_userToken,
+                &natNetwork);
 
             if (m_networkingEngine)
             {
@@ -692,7 +677,7 @@ WslCoreVm::~WslCoreVm() noexcept
         m_terminatingEvent.SetEvent();
     }
 
-    if (m_system)
+    if (m_backend)
     {
         bool unexpectedTerminate = m_vmExitEvent.is_signaled();
         bool forcedTerminate = false;
@@ -712,7 +697,7 @@ WslCoreVm::~WslCoreVm() noexcept
             {
                 try
                 {
-                    wsl::windows::common::hcs::TerminateComputeSystem(m_system.get());
+                    m_backend->Terminate();
                 }
                 CATCH_LOG()
             }
@@ -751,7 +736,7 @@ WslCoreVm::~WslCoreVm() noexcept
     }
 
     // Close the handle to the VM. This will wait for any outstanding callbacks.
-    m_system.reset();
+    m_backend.reset();
 
     // This loops helps against a potential crash in build <= Windows 11 22H2.
     for (const auto& e : m_plan9Servers)
@@ -774,6 +759,7 @@ WslCoreVm::~WslCoreVm() noexcept
         {
             try
             {
+                // N.B. RevokeVmAccess is a static API that only needs the machine ID, not the VM handle.
                 wsl::windows::common::hcs::RevokeVmAccess(m_machineId.c_str(), Entry.first.Path.c_str());
             }
             CATCH_LOG()
@@ -818,9 +804,9 @@ WslCoreVm::~WslCoreVm() noexcept
     WSL_LOG("TerminateVmStop");
 }
 
-wil::unique_socket WslCoreVm::AcceptConnection(_In_ DWORD ReceiveTimeout, _In_ const std::source_location& Location) const
+wil::unique_socket WslCoreVm::AcceptConnection(_In_ DWORD ReceiveTimeout, [[maybe_unused]] _In_ const std::source_location& Location) const
 {
-    auto socket = hvsocket::CancellableAccept(m_listenSocket.get(), m_vmConfig.KernelBootTimeout, m_terminatingEvent.get(), Location);
+    auto socket = m_backend->AcceptGuestConnection(m_listenSocket.get(), m_vmConfig.KernelBootTimeout, m_terminatingEvent.get());
     THROW_HR_IF(E_ABORT, !socket.has_value());
 
     if (ReceiveTimeout != 0)
@@ -834,7 +820,7 @@ wil::unique_socket WslCoreVm::AcceptConnection(_In_ DWORD ReceiveTimeout, _In_ c
 _Requires_lock_held_(m_guestDeviceLock)
 void WslCoreVm::AddDrvFsShare(_In_ bool Admin, _In_ HANDLE UserToken)
 {
-    THROW_HR_IF(HCS_E_TERMINATED, !m_system);
+    THROW_HR_IF(HCS_E_TERMINATED, !m_backend);
 
     // Allow the Plan 9 server to create NT symlinks.
     //
@@ -947,7 +933,7 @@ ULONG WslCoreVm::AttachDiskLockHeld(
         FreeLun(Lun.value());
         if (WI_IsFlagSet(diskFlags, DiskStateFlags::AccessGranted))
         {
-            wsl::windows::common::hcs::RevokeVmAccess(m_machineId.c_str(), Disk);
+            m_backend->RevokeVmAccess(Disk);
         }
 
         if (WI_IsFlagSet(diskFlags, DiskStateFlags::Online))
@@ -988,7 +974,7 @@ ULONG WslCoreVm::AttachDiskLockHeld(
 
             // Add the disk to the VM.
             wsl::shared::retry::RetryWithTimeout<void>(
-                std::bind(wsl::windows::common::hcs::AddPassThroughDisk, m_system.get(), Disk, Lun.value()),
+                std::bind(&IWslVmBackend::AttachPassThroughDisk, m_backend.get(), Disk, Lun.value()),
                 wsl::windows::common::disk::c_diskOperationRetry,
                 std::chrono::milliseconds(m_vmConfig.MountDeviceTimeout),
                 []() { return wil::ResultFromCaughtException() == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION); });
@@ -1005,7 +991,7 @@ ULONG WslCoreVm::AttachDiskLockHeld(
 
             auto grantDiskAccess = [&]() {
                 auto runAsUser = wil::impersonate_token(UserToken);
-                wsl::windows::common::hcs::GrantVmAccess(m_machineId.c_str(), Disk);
+                m_backend->GrantVmAccess(Disk);
                 WI_SetFlag(diskFlags, DiskStateFlags::AccessGranted);
             };
 
@@ -1016,13 +1002,13 @@ ULONG WslCoreVm::AttachDiskLockHeld(
             }
 
             auto result = wil::ResultFromException([&]() {
-                wsl::windows::common::hcs::AddVhd(m_system.get(), Disk, Lun.value(), WI_IsFlagSet(Flags, MountFlags::ReadOnly));
+                m_backend->AttachVhd(Disk, Lun.value(), WI_IsFlagSet(Flags, MountFlags::ReadOnly));
             });
 
             if (result == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED) && WI_IsFlagClear(diskFlags, DiskStateFlags::AccessGranted))
             {
                 grantDiskAccess();
-                wsl::windows::common::hcs::AddVhd(m_system.get(), Disk, Lun.value(), WI_IsFlagSet(Flags, MountFlags::ReadOnly));
+                m_backend->AttachVhd(Disk, Lun.value(), WI_IsFlagSet(Flags, MountFlags::ReadOnly));
             }
             else
             {
@@ -1051,7 +1037,7 @@ void WslCoreVm::CollectCrashDumps(wil::unique_socket&& listenSocket) const
     {
         try
         {
-            auto socket = hvsocket::CancellableAccept(listenSocket.get(), INFINITE, m_terminatingEvent.get());
+            auto socket = m_backend->AcceptGuestConnection(listenSocket.get(), INFINITE, m_terminatingEvent.get());
             if (!socket.has_value())
             {
                 break; // VM is exiting.
@@ -1243,7 +1229,7 @@ std::shared_ptr<LxssRunningInstance> WslCoreVm::CreateInstanceInternal(
 
 wil::unique_socket WslCoreVm::CreateListeningSocket() const
 {
-    return wsl::windows::common::hvsocket::Listen(m_runtimeId, 0);
+    return m_backend->ListenForGuestConnection(0);
 }
 
 std::pair<int, LX_MINI_MOUNT_STEP> WslCoreVm::DetachDisk(_In_opt_ PCWSTR Disk)
@@ -1285,10 +1271,10 @@ std::pair<int, LX_MINI_MOUNT_STEP> WslCoreVm::DetachDisk(_In_opt_ PCWSTR Disk)
             }
 
             // Detach the disk from the VM.
-            wsl::windows::common::hcs::RemoveScsiDisk(m_system.get(), it->second.Lun);
+            m_backend->DetachDisk(it->second.Lun);
             if (WI_VERIFY(WI_IsFlagSet(it->second.Flags, DiskStateFlags::AccessGranted)))
             {
-                wsl::windows::common::hcs::RevokeVmAccess(m_machineId.c_str(), it->first.Path.c_str());
+                m_backend->RevokeVmAccess(it->first.Path.c_str());
             }
 
             FreeLun(it->second.Lun);
@@ -1335,10 +1321,10 @@ void WslCoreVm::EjectVhdLockHeld(_In_ PCWSTR VhdPath)
         // Impersonate the session manager and remove the vhd.
         {
             auto runAsSelf = wil::run_as_self();
-            wsl::windows::common::hcs::RemoveScsiDisk(m_system.get(), search->second.Lun);
+            m_backend->DetachDisk(search->second.Lun);
             if (WI_IsFlagSet(search->second.Flags, DiskStateFlags::AccessGranted))
             {
-                wsl::windows::common::hcs::RevokeVmAccess(m_machineId.c_str(), VhdPath);
+                m_backend->RevokeVmAccess(VhdPath);
             }
         }
 
@@ -1765,7 +1751,7 @@ void WslCoreVm::GrantVmWorkerProcessAccessToDisk(_In_ PCWSTR Disk, _In_opt_ HAND
         THROW_HR_IF(WSL_E_ELEVATION_NEEDED_TO_MOUNT_DISK, ((!wsl::windows::common::security::IsTokenElevated(UserToken))));
     }
 
-    wsl::windows::common::hcs::GrantVmAccess(m_machineId.c_str(), Disk);
+    m_backend->GrantVmAccess(Disk);
 }
 
 void WslCoreVm::InitializeGuest()
@@ -2001,7 +1987,7 @@ void WslCoreVm::MountRootNamespaceFolder(_In_ LPCWSTR HostPath, _In_ LPCWSTR Gue
     auto lock = m_lock.lock_exclusive();
 
     const auto flags = (ReadOnly ? hcs::Plan9ShareFlags::ReadOnly : hcs::Plan9ShareFlags::None) | hcs::Plan9ShareFlags::AllowOptions;
-    wsl::windows::common::hcs::AddPlan9Share(m_system.get(), Name, Name, HostPath, LX_INIT_UTILITY_VM_PLAN9_PORT, flags);
+    m_backend->AddPlan9Share(Name, Name, HostPath, LX_INIT_UTILITY_VM_PLAN9_PORT, flags);
 
     wsl::shared::MessageWriter<LX_MINI_INIT_MOUNT_FOLDER_MESSAGE> message(LxMiniInitMountFolder);
     message.WriteString(message->PathIndex, GuestPath);
@@ -2219,7 +2205,7 @@ void WslCoreVm::OnCrash(_In_ LPCWSTR Details)
 void WslCoreVm::OnExit(_In_opt_ PCWSTR ExitDetails)
 {
     // Indicate that the VM has exited, and wake any waiting threads. The instance may be in its destructor at this
-    // point but closing m_system will wait for any outstanding callbacks, so this function will complete before the
+    // point but closing m_backend will wait for any outstanding callbacks, so this function will complete before the
     // destructor continues.
     std::function<void(GUID)> terminationCallback{};
     {
@@ -2382,7 +2368,7 @@ void WslCoreVm::RegisterCallbacks(_In_ const std::function<void(ULONG)>& DistroE
     if (m_vmConfig.EnableHostFileSystemAccess && m_vmConfig.EnableVirtioFs)
     {
         // Create a thread listening for handling virtiofs requests.
-        auto listenSocket = wsl::windows::common::hvsocket::Listen(m_runtimeId, LX_INIT_UTILITY_VM_VIRTIOFS_PORT);
+        auto listenSocket = m_backend->ListenForGuestConnection(LX_INIT_UTILITY_VM_VIRTIOFS_PORT);
         m_virtioFsThread = std::thread(&WslCoreVm::VirtioFsWorker, this, std::move(listenSocket));
     }
 }
@@ -2546,7 +2532,7 @@ try
     {
         // Create a worker thread to handle each request.
 
-        auto socket = hvsocket::CancellableAccept(listenSocket.get(), INFINITE, m_terminatingEvent.get());
+        auto socket = m_backend->AcceptGuestConnection(listenSocket.get(), INFINITE, m_terminatingEvent.get());
         if (!socket.has_value())
         {
             break;

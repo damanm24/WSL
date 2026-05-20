@@ -82,7 +82,7 @@ private:
 
     // ttrpc client for VM lifecycle management.
     std::filesystem::path m_ttrpcSocketPath;
-    std::unique_ptr<TtrpcClient> m_ttrpcClient;
+    std::unique_ptr<wsl::windows::service::wslc::TtrpcClient> m_ttrpcClient;
 
     // Vsock bridge path for guest communication (replaces HvSocket).
     std::filesystem::path m_vsockBridgePath;

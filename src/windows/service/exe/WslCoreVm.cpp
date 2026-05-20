@@ -576,7 +576,7 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
                 std::move(dnsTunnelingSocket),
                 m_guestDeviceManager,
                 m_userToken,
-                &natNetwork);
+                std::addressof(natNetwork));
 
             if (m_networkingEngine)
             {

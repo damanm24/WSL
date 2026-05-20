@@ -41,11 +41,17 @@ public:
     // ========================================================================
 
     /// <summary>
-    /// Creates and starts the virtual machine.
+    /// Creates the virtual machine and initializes all resources (compute system, runtime ID,
+    /// device manager). The VM is NOT yet running after this call; call Start() to launch it.
     /// The Config parameter is backend-specific (JSON for HCS, ttrpc config for OpenVMM).
-    /// After this call returns successfully, the VM is running and ready to accept connections.
     /// </summary>
-    virtual void CreateAndStart(_In_ const CreateParams& Params, _In_ PCWSTR Config) = 0;
+    virtual void Create(_In_ const CreateParams& Params, _In_ PCWSTR Config) = 0;
+
+    /// <summary>
+    /// Starts the virtual machine. Must be called after Create() and after any callbacks
+    /// (e.g. exit callbacks) have been registered, so no exit events are missed.
+    /// </summary>
+    virtual void Start() = 0;
 
     /// <summary>
     /// Terminates the virtual machine forcefully.

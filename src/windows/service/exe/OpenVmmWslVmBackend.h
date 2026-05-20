@@ -20,7 +20,8 @@ public:
     NON_MOVABLE(OpenVmmWslVmBackend);
 
     // Lifecycle
-    void CreateAndStart(_In_ const CreateParams& Params, _In_ PCWSTR Config) override;
+    void Create(_In_ const CreateParams& Params, _In_ PCWSTR Config) override;
+    void Start() override;
     void Terminate() override;
     void RegisterExitCallback(_In_ ExitCallback Callback) override;
     GUID GetRuntimeId() const override;
@@ -73,7 +74,6 @@ private:
     std::wstring m_machineId;
     GUID m_runtimeId{};
     ExitCallback m_exitCallback;
-    std::shared_ptr<GuestDeviceManager> m_guestDeviceManager;
 
     // OpenVMM process management.
     wil::unique_handle m_processHandle;

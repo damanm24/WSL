@@ -9,9 +9,10 @@
 
 using namespace wsl::windows::common;
 
-void HcsWslVmBackend::CreateAndStart(_In_ const CreateParams& Params, _In_ PCWSTR Config)
+void HcsWslVmBackend::Create(_In_ const CreateParams& Params, _In_ PCWSTR Config)
 {
     m_machineId = Params.MachineId;
+    m_config = Config;
 
     // Create the compute system and retrieve the runtime ID.
     m_system = wsl::windows::common::hcs::CreateComputeSystem(m_machineId.c_str(), Config);
@@ -20,15 +21,18 @@ void HcsWslVmBackend::CreateAndStart(_In_ const CreateParams& Params, _In_ PCWST
 
     // Initialize the guest device manager.
     m_guestDeviceManager = std::make_shared<GuestDeviceManager>(m_machineId, m_runtimeId);
+}
 
-    // Start the compute system.
+void HcsWslVmBackend::Start()
+{
+    // Start the compute system. If startup fails, release the system handle so
+    // Terminate() does not attempt to terminate a VM that never ran.
     try
     {
-        wsl::windows::common::hcs::StartComputeSystem(m_system.get(), Config);
+        wsl::windows::common::hcs::StartComputeSystem(m_system.get(), m_config.c_str());
     }
     catch (...)
     {
-        // Reset m_system so we don't try to terminate a VM that never started.
         m_system.reset();
         throw;
     }

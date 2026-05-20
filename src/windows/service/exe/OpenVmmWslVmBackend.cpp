@@ -14,14 +14,16 @@ OpenVmmWslVmBackend::~OpenVmmWslVmBackend()
     }
 }
 
-void OpenVmmWslVmBackend::CreateAndStart(_In_ const CreateParams& Params, _In_ PCWSTR /*Config*/)
+void OpenVmmWslVmBackend::Create(_In_ const CreateParams& Params, _In_ PCWSTR /*Config*/)
 {
     m_machineId = Params.MachineId;
     m_runtimeId = Params.VmId;
+    // Note: GuestDeviceManager is HCS-specific (it calls HcsOpenComputeSystem).
+    // OpenVMM device management goes through ttrpc, so no GuestDeviceManager here.
+}
 
-    // Initialize the guest device manager.
-    m_guestDeviceManager = std::make_shared<GuestDeviceManager>(m_machineId, m_runtimeId);
-
+void OpenVmmWslVmBackend::Start()
+{
     // TODO: Parse the config or build OpenVMM-specific config from CreateParams.
     // TODO: Launch openvmm.exe, connect via ttrpc, and create+resume the VM.
     LaunchOpenVmm();
@@ -116,7 +118,8 @@ bool OpenVmmWslVmBackend::AddGpu()
 
 std::shared_ptr<GuestDeviceManager> OpenVmmWslVmBackend::GetGuestDeviceManager()
 {
-    return m_guestDeviceManager;
+    // OpenVMM device management goes through ttrpc, not GuestDeviceManager (which is HCS-specific).
+    return nullptr;
 }
 
 std::unique_ptr<wsl::core::INetworkingEngine> OpenVmmWslVmBackend::CreateNetworkingEngine(

@@ -19,7 +19,8 @@ public:
     ~HcsWslVmBackend() override = default;
 
     // VM Lifecycle
-    void CreateAndStart(_In_ const CreateParams& Params, _In_ PCWSTR Config) override;
+    void Create(_In_ const CreateParams& Params, _In_ PCWSTR Config) override;
+    void Start() override;
     void Terminate() override;
     void RegisterExitCallback(_In_ ExitCallback Callback) override;
     GUID GetRuntimeId() const override;
@@ -74,6 +75,7 @@ private:
     wsl::windows::common::hcs::unique_hcs_system m_system;
     GUID m_runtimeId{};
     std::wstring m_machineId;
+    std::wstring m_config;
     ExitCallback m_exitCallback;
     std::shared_ptr<GuestDeviceManager> m_guestDeviceManager;
 };

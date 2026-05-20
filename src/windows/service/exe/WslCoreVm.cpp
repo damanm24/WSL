@@ -329,7 +329,8 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
         m_backend = std::make_unique<HcsWslVmBackend>();
     }
 
-    m_backend->CreateAndStart(
+    // Create (but do not yet start) the VM so the runtime ID and device manager are available.
+    m_backend->Create(
         IWslVmBackend::CreateParams{VmId, m_machineId, m_userToken, m_windowsVersion}, json.c_str());
     m_runtimeId = m_backend->GetRuntimeId();
     WI_ASSERT(IsEqualGUID(VmId, m_runtimeId));
@@ -349,6 +350,7 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
     }
 
     // Register a callback to detect if the utility VM exits unexpectedly.
+    // This must happen before Start() so no exit events are missed.
 #if WSL_INCLUDE_OPENVMM
     if (m_vmConfig.UseOpenVmm)
     {
@@ -364,6 +366,9 @@ void WslCoreVm::Initialize(const GUID& VmId, const wil::shared_handle& UserToken
     }
 
     signalEarlyTermination.release();
+
+    // Start the VM. The exit callback is already registered above, so no exit events are missed.
+    m_backend->Start();
 
     // Add GPUs to the utility VM.
     if (m_vmConfig.EnableGpuSupport)

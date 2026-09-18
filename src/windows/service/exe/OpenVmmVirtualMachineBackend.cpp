@@ -8,6 +8,8 @@
 #include "SubProcess.h"
 #include "wslopenvmm.h"
 
+namespace validation = wsl::windows::common::vm::validation;
+
 namespace {
 
 constexpr UINT64 c_memoryGranularity = 2ULL * 1024 * 1024;
@@ -23,53 +25,6 @@ void DestroyConfig(WslOpenVmmConfig* Config) noexcept
 
 using UniqueConfig = wil::unique_any<WslOpenVmmConfig*, decltype(&DestroyConfig), DestroyConfig>;
 
-void ValidateFeature(VmFeatureRequest Request, PCWSTR Setting)
-{
-    switch (Request)
-    {
-    case VmFeatureRequest::Disabled:
-    case VmFeatureRequest::Preferred:
-        return;
-    case VmFeatureRequest::Required:
-        THROW_HR_MSG(c_notSupported, "OpenVMM does not support the required %ls setting", Setting);
-    }
-
-    THROW_HR(E_INVALIDARG);
-}
-
-void ValidatePath(const std::filesystem::path& Path)
-{
-    THROW_HR_IF_MSG(
-        E_INVALIDARG,
-        Path.empty() || !Path.is_absolute() || Path.native().find(L'\0') != std::wstring::npos,
-        "OpenVMM requires an absolute, nonempty host path");
-}
-
-const VmVirtualDiskSource& ValidateDiskRequest(const VmDiskRequest& Request)
-{
-    const auto* source = std::get_if<VmVirtualDiskSource>(&Request.Source);
-    THROW_HR_IF(c_notSupported, source == nullptr);
-    ValidatePath(source->Path);
-    switch (source->Format)
-    {
-    case VmDiskFormat::Vhd:
-        THROW_HR_IF(E_INVALIDARG, _wcsicmp(source->Path.extension().c_str(), L".vhd") != 0);
-        break;
-    case VmDiskFormat::Vhdx:
-        THROW_HR_IF(E_INVALIDARG, _wcsicmp(source->Path.extension().c_str(), L".vhdx") != 0);
-        break;
-    default:
-        THROW_HR(E_INVALIDARG);
-    }
-
-    if (Request.Placement)
-    {
-        THROW_HR_IF(c_notSupported, Request.Placement->Address.Controller != 0 || Request.Placement->Address.Lun >= c_maximumDisks);
-    }
-
-    return *source;
-}
-
 wil::unique_hfile OpenBackingFile(const std::filesystem::path& Path, bool ReadOnly)
 {
     wil::unique_hfile file{CreateFileW(
@@ -81,13 +36,6 @@ wil::unique_hfile OpenBackingFile(const std::filesystem::path& Path, bool ReadOn
     file.reset(CreateFileW(Path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
     THROW_LAST_ERROR_IF(!file);
     return file;
-}
-
-void ValidateConsolePath(const std::filesystem::path& Path)
-{
-    ValidatePath(Path);
-    THROW_HR_IF_MSG(
-        c_notSupported, !Path.native().starts_with(L"\\\\.\\pipe\\"), "OpenVMM consoles require a caller-provided named pipe");
 }
 
 void DeleteOwnedFile(const std::filesystem::path& Path) noexcept
@@ -105,12 +53,6 @@ void DeleteOwnedFile(const std::filesystem::path& Path) noexcept
 std::filesystem::path GetVsockListenerPath(const std::filesystem::path& VsockPath, GuestServicePort Port)
 {
     return std::format(L"{}_{:08x}-facb-11e6-bd58-64006a7986d3", VsockPath.native(), Port.Value);
-}
-
-void ValidateName(std::wstring_view Name, PCWSTR Description)
-{
-    THROW_HR_IF_MSG(
-        E_INVALIDARG, Name.empty() || Name.find(L'\0') != std::wstring_view::npos, "%ls must be nonempty and cannot contain NUL", Description);
 }
 
 std::wstring GetConsommeCidr(const VmUserModeNatNetwork& Configuration)
@@ -164,12 +106,6 @@ std::wstring FormatIpAddress(const VmIpAddress& Address)
     return result;
 }
 
-template <typename Tag>
-void ValidateResourceId(const VmResourceId<Tag>& Id, const VmInstanceId& Owner)
-{
-    THROW_HR_IF(E_INVALIDARG, Id.Value == 0 || !IsEqualGUID(Id.Owner.VmId, Owner.VmId));
-}
-
 } // namespace
 
 OpenVmmVirtualMachineBackend::State::GuestListener::~GuestListener() noexcept
@@ -178,29 +114,21 @@ OpenVmmVirtualMachineBackend::State::GuestListener::~GuestListener() noexcept
     DeleteOwnedFile(Path);
 }
 
-void OpenVmmVirtualMachineBackend::State::CloseGuestListeners() noexcept
-{
-    for (const auto& entry : m_guestListeners)
-    {
-        LOG_IF_WIN32_BOOL_FALSE(SetEvent(entry.second->CancellationEvent.get()));
-    }
-
-    m_guestListeners.clear();
-}
-
 VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmCreateRequest& Request)
 {
     THROW_HR_IF(E_INVALIDARG, IsEqualGUID(Request.Identity.VmId, GUID_NULL));
     THROW_HR_IF(E_INVALIDARG, Request.Processor.Count == 0 || Request.Memory.SizeBytes == 0);
     THROW_HR_IF_MSG(c_notSupported, wsl::shared::Arm64, "OpenVMM direct boot is currently supported only on x64");
-    ValidatePath(Request.Boot.KernelPath);
-    ValidatePath(Request.Boot.InitrdPath);
+    validation::ValidatePath(Request.Boot.KernelPath, L"OpenVMM");
+    validation::ValidatePath(Request.Boot.InitrdPath, L"OpenVMM");
     THROW_HR_IF(E_INVALIDARG, Request.Boot.KernelCommandLine.find(L'\0') != std::wstring::npos);
     THROW_HR_IF(
         E_INVALIDARG,
         Request.Boot.Method != VmBootMethod::Automatic && Request.Boot.Method != VmBootMethod::LinuxDirect &&
             Request.Boot.Method != VmBootMethod::Uefi);
     THROW_HR_IF(c_notSupported, Request.Boot.Method == VmBootMethod::Uefi);
+    THROW_HR_IF(c_notSupported, Request.Boot.UefiRootPath.has_value());
+    THROW_HR_IF(c_notSupported, Request.EnablePlan9 || Request.EnableBattery || Request.Memory.Mmio.has_value());
 
     VmDescription description;
     description.Identity = Request.Identity;
@@ -213,17 +141,25 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
         c_notSupported,
         description.Memory.SizeBytes < c_memoryGranularity || Request.Memory.SizeBytes > c_maximumMemory,
         "OpenVMM currently supports memory sizes from 2 MiB to 4 GiB; memory is not silently capped");
-    ValidateFeature(Request.Processor.NestedVirtualization, L"nested virtualization");
-    ValidateFeature(Request.Processor.PerfmonPmu, L"PMU");
-    ValidateFeature(Request.Processor.PerfmonLbr, L"LBR");
-    ValidateFeature(Request.Memory.AllowOvercommit, L"memory overcommit");
-    ValidateFeature(Request.Memory.DeferredCommit, L"deferred memory commit");
-    ValidateFeature(Request.Memory.ColdDiscard, L"cold discard");
+    validation::ValidateFeature(Request.Processor.NestedVirtualization, L"nested virtualization");
+    validation::ValidateFeature(Request.Processor.PerfmonPmu, L"PMU");
+    validation::ValidateFeature(Request.Processor.PerfmonLbr, L"LBR");
+    validation::ValidateFeature(Request.Memory.AllowOvercommit, L"memory overcommit");
+    validation::ValidateFeature(Request.Memory.DeferredCommit, L"deferred memory commit");
+    validation::ValidateFeature(Request.Memory.ColdDiscard, L"cold discard");
 
+    if (Request.Memory.SmallPages)
+    {
+        validation::ValidateUnsupportedSelection(Request.Memory.SmallPages->Policy);
+    }
+    if (Request.HostingProcessNameSuffix)
+    {
+        validation::ValidateName(Request.HostingProcessNameSuffix->Value, L"hosting process name suffix");
+        validation::ValidateUnsupportedSelection(Request.HostingProcessNameSuffix->Policy);
+    }
     if (Request.CrashCapture)
     {
-        THROW_HR_IF(E_INVALIDARG, Request.CrashCapture->Policy != VmSelectionPolicy::Required && Request.CrashCapture->Policy != VmSelectionPolicy::Preferred);
-        THROW_HR_IF(c_notSupported, Request.CrashCapture->Policy == VmSelectionPolicy::Required);
+        validation::ValidateUnsupportedSelection(Request.CrashCapture->Policy);
     }
 
     description.Boot.Method = VmBootMethod::LinuxDirect;
@@ -237,7 +173,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
         {
             THROW_HR_IF(c_notSupported, serial->Port != 0);
             THROW_HR_IF(E_INVALIDARG, serialConfigured);
-            ValidateConsolePath(serial->NamedPipe);
+            validation::ValidateConsolePath(serial->NamedPipe, L"OpenVMM", c_notSupported, false);
             serialConfigured = true;
         }
         else
@@ -245,7 +181,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
             const auto& virtio = std::get<VmVirtioConsole>(console.Device);
             THROW_HR_IF(c_notSupported, virtio.Port != 0 || !virtio.GuestName.empty() || !virtio.ConsoleSupport);
             THROW_HR_IF(E_INVALIDARG, virtioConfigured);
-            ValidateConsolePath(virtio.NamedPipe);
+            validation::ValidateConsolePath(virtio.NamedPipe, L"OpenVMM", c_notSupported, false);
             virtioConfigured = true;
         }
         description.Boot.Consoles.push_back(console);
@@ -257,7 +193,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
     {
         THROW_HR_IF(E_INVALIDARG, disk.Key.empty() || description.BootDisks.contains(disk.Key));
         description.BootDisks.emplace(disk.Key, VmDiskAttachment{});
-        ValidateDiskRequest(disk.Disk);
+        validation::ValidateDiskRequest(disk.Disk, c_maximumDisks);
         if (disk.Disk.Placement)
         {
             const auto& placement = *disk.Disk.Placement;
@@ -302,7 +238,7 @@ OpenVmmVirtualMachineBackend::~OpenVmmVirtualMachineBackend() noexcept
 {
     {
         auto lock = m_state->m_lock.lock_exclusive();
-        m_state->CloseGuestListeners();
+        CloseGuestListeners();
     }
     if (m_state->m_processWait)
     {
@@ -458,7 +394,7 @@ void CALLBACK OpenVmmVirtualMachineBackend::OnProcessExit(PTP_CALLBACK_INSTANCE,
     LOG_IF_WIN32_BOOL_FALSE(SetEvent(backend.m_state->m_exitEvent.get()));
     LOG_IF_WIN32_BOOL_FALSE(SetEvent(backend.m_state->m_operationCancellationEvent.get()));
     auto lock = backend.m_state->m_lock.lock_exclusive();
-    backend.m_state->CloseGuestListeners();
+    backend.CloseGuestListeners();
 }
 
 VmPlatformCapabilities OpenVmmVirtualMachineBackend::QueryCapabilities()
@@ -548,7 +484,7 @@ void OpenVmmVirtualMachineBackend::Terminate()
     m_state->m_fileSystemDevices.clear();
     m_state->m_portBindings.clear();
     m_state->m_networkAdapters.clear();
-    m_state->CloseGuestListeners();
+    CloseGuestListeners();
 }
 
 void OpenVmmVirtualMachineBackend::CancelPendingOperations() noexcept
@@ -559,22 +495,14 @@ void OpenVmmVirtualMachineBackend::CancelPendingOperations() noexcept
     }
     LOG_IF_WIN32_BOOL_FALSE(SetEvent(m_state->m_operationCancellationEvent.get()));
     auto lock = m_state->m_lock.lock_exclusive();
-    m_state->CloseGuestListeners();
+    CloseGuestListeners();
 }
 
-VmGuestListener OpenVmmVirtualMachineBackend::CreateGuestListener(GuestServicePort Port)
+std::shared_ptr<VmGuestListenerState> OpenVmmVirtualMachineBackend::ConfigureGuestListener(const VmGuestListener& Listener)
 {
-    auto lock = m_state->m_lock.lock_exclusive();
-    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_vm);
-    THROW_HR_IF(E_BOUNDS, m_state->m_nextListenerId == UINT64_MAX);
-    for (const auto& entry : m_state->m_guestListeners)
-    {
-        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), entry.second->Listener.Port.Value == Port.Value);
-    }
-
     auto listener = std::make_shared<State::GuestListener>();
-    listener->Listener = {{m_state->m_description.Identity, m_state->m_nextListenerId}, Port};
-    listener->Path = GetVsockListenerPath(m_state->m_vsockPath, Port);
+    listener->Listener = Listener;
+    listener->Path = GetVsockListenerPath(m_state->m_vsockPath, Listener.Port);
     DeleteOwnedFile(listener->Path);
 
     listener->Socket.reset(::socket(AF_UNIX, SOCK_STREAM, 0));
@@ -591,29 +519,19 @@ VmGuestListener OpenVmmVirtualMachineBackend::CreateGuestListener(GuestServicePo
         static_cast<DWORD>(WSAGetLastError()),
         bind(listener->Socket.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR);
     THROW_WIN32_IF(static_cast<DWORD>(WSAGetLastError()), listen(listener->Socket.get(), SOMAXCONN) == SOCKET_ERROR);
+    return listener;
+}
 
-    const auto result = listener->Listener;
-    const auto inserted = m_state->m_guestListeners.emplace(result.Id.Value, std::move(listener)).second;
-    WI_ASSERT(inserted);
-    ++m_state->m_nextListenerId;
-    return result;
+VmGuestListener OpenVmmVirtualMachineBackend::CreateGuestListener(GuestServicePort Port)
+{
+    auto lock = m_state->m_lock.lock_exclusive();
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_vm);
+    return RegisterGuestListener(m_state->m_description.Identity, Port);
 }
 
 wil::unique_socket OpenVmmVirtualMachineBackend::AcceptGuestConnection(VmListenerId Listener)
 {
-    THROW_HR_IF(E_INVALIDARG, Listener.Value == 0 || !IsEqualGUID(Listener.Owner.VmId, m_state->m_description.Identity.VmId));
-
-    std::shared_ptr<State::GuestListener> listener;
-    {
-        auto lock = m_state->m_lock.lock_shared();
-        const auto entry = m_state->m_guestListeners.find(Listener.Value);
-        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), entry == m_state->m_guestListeners.end());
-        listener = entry->second;
-    }
-
-    auto socket = wsl::windows::common::socket::CancellableAccept(listener->Socket.get(), INFINITE, listener->CancellationEvent.get());
-    THROW_HR_IF(E_ABORT, !socket);
-    return std::move(*socket);
+    return AcceptGuestListenerConnection(Listener, m_state->m_description.Identity);
 }
 
 wil::unique_socket OpenVmmVirtualMachineBackend::ConnectGuest(GuestServicePort Port)
@@ -670,17 +588,12 @@ wil::unique_socket OpenVmmVirtualMachineBackend::ConnectGuest(GuestServicePort P
 
 void OpenVmmVirtualMachineBackend::CloseGuestListener(VmListenerId Listener)
 {
-    THROW_HR_IF(E_INVALIDARG, Listener.Value == 0 || !IsEqualGUID(Listener.Owner.VmId, m_state->m_description.Identity.VmId));
-    auto lock = m_state->m_lock.lock_exclusive();
-    const auto entry = m_state->m_guestListeners.find(Listener.Value);
-    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), entry == m_state->m_guestListeners.end());
-    THROW_IF_WIN32_BOOL_FALSE(SetEvent(entry->second->CancellationEvent.get()));
-    m_state->m_guestListeners.erase(entry);
+    RemoveGuestListener(Listener, m_state->m_description.Identity);
 }
 
 VmDiskAttachment OpenVmmVirtualMachineBackend::AttachDisk(const VmDiskRequest& Request)
 {
-    const auto& source = ValidateDiskRequest(Request);
+    const auto& source = validation::ValidateDiskRequest(Request, c_maximumDisks);
     auto backingFile = OpenBackingFile(source.Path, Request.ReadOnly);
     auto lock = m_state->m_lock.lock_exclusive();
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_vm);
@@ -738,7 +651,7 @@ void OpenVmmVirtualMachineBackend::DetachDisk(VmDiskId Disk)
 
 VmFileSystemDevice OpenVmmVirtualMachineBackend::CreateFileSystemDevice(const VmFileSystemDeviceRequest& Request)
 {
-    ValidateName(Request.Transport.Tag, L"OpenVMM virtio-fs tag");
+    validation::ValidateName(Request.Transport.Tag, L"OpenVMM virtio-fs tag");
     THROW_HR_IF_MSG(
         c_notSupported,
         Request.Transport.Layout != VmVirtioFsLayout::SingleShare,
@@ -763,8 +676,8 @@ VmFileSystemDevice OpenVmmVirtualMachineBackend::CreateFileSystemDevice(const Vm
 
 VmFileSystemShare OpenVmmVirtualMachineBackend::AddFileSystemShare(VmDeviceId Device, const VmFileSystemShareRequest& Request)
 {
-    ValidateResourceId(Device, m_state->m_description.Identity);
-    ValidatePath(Request.HostPath);
+    validation::ValidateResourceId(Device, m_state->m_description.Identity);
+    validation::ValidatePath(Request.HostPath, L"OpenVMM");
     THROW_HR_IF_MSG(
         E_INVALIDARG, !Request.Name.empty(), "A single-share OpenVMM virtio-fs device does not accept a child share name");
     THROW_HR_IF_MSG(c_notSupported, !Request.Options.MountOptions.empty(), "OpenVMM does not support virtio-fs mount options");
@@ -800,7 +713,7 @@ VmFileSystemShare OpenVmmVirtualMachineBackend::AddFileSystemShare(VmDeviceId De
 
 void OpenVmmVirtualMachineBackend::RemoveFileSystemShare(VmShareId Share)
 {
-    ValidateResourceId(Share, m_state->m_description.Identity);
+    validation::ValidateResourceId(Share, m_state->m_description.Identity);
     auto lock = m_state->m_lock.lock_exclusive();
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_vm);
     const auto share = m_state->m_fileSystemShares.find(Share.Value);
@@ -816,7 +729,7 @@ void OpenVmmVirtualMachineBackend::RemoveFileSystemShare(VmShareId Share)
 
 VmNetworkAttachment OpenVmmVirtualMachineBackend::AddNetworkAdapter(const VmNetworkAdapterRequest& Request)
 {
-    ValidateName(Request.Tag, L"OpenVMM network adapter tag");
+    validation::ValidateName(Request.Tag, L"OpenVMM network adapter tag");
     const auto cidr = GetConsommeCidr(Request.Configuration);
     const auto macAddress = wsl::shared::string::FormatMacAddress(Request.Configuration.ClientMac.Bytes, L'-');
     GUID nicId{};
@@ -843,7 +756,7 @@ VmNetworkAttachment OpenVmmVirtualMachineBackend::AddNetworkAdapter(const VmNetw
 
 VmPortBinding OpenVmmVirtualMachineBackend::BindPort(VmDeviceId Device, const VmPortBindingRequest& Request)
 {
-    ValidateResourceId(Device, m_state->m_description.Identity);
+    validation::ValidateResourceId(Device, m_state->m_description.Identity);
     THROW_HR_IF_MSG(
         c_notSupported, Request.Listen.Port == 0, "OpenVMM cannot report the allocated port for a dynamic host port binding");
     THROW_HR_IF(E_INVALIDARG, Request.GuestPort == 0);
@@ -888,7 +801,7 @@ VmPortBinding OpenVmmVirtualMachineBackend::BindPort(VmDeviceId Device, const Vm
 
 void OpenVmmVirtualMachineBackend::UnbindPort(VmPortBindingId Binding)
 {
-    ValidateResourceId(Binding, m_state->m_description.Identity);
+    validation::ValidateResourceId(Binding, m_state->m_description.Identity);
     auto lock = m_state->m_lock.lock_exclusive();
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_vm);
     const auto binding = m_state->m_portBindings.find(Binding.Value);

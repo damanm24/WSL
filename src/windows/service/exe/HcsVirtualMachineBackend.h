@@ -58,10 +58,19 @@ private:
 
     struct State
     {
+        struct AttachedDisk
+        {
+            VmDiskAttachment Attachment;
+        };
+
+        wil::srwlock m_lock;
         VmDescription m_description;
+        std::wstring m_configuration;
         wil::unique_event m_terminatingEvent{wil::EventOptions::ManualReset};
+        _Guarded_by_(m_lock) std::map<std::uint64_t, AttachedDisk> m_attachedDisks;
+        _Guarded_by_(m_lock) std::uint64_t m_nextDiskId = 1;
         // Closing the system drains callbacks before their event and context are destroyed.
-        wsl::windows::common::hcs::unique_hcs_system m_system;
+        _Guarded_by_(m_lock) wsl::windows::common::hcs::unique_hcs_system m_system;
     };
 
     std::unique_ptr<State> m_state;

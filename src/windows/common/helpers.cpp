@@ -545,6 +545,15 @@ bool wsl::windows::common::helpers::IsVmemmSuffixSupported()
         ((windowsVersion.BuildNumber == WindowsBuildNumbers::Cobalt) && (windowsVersion.UpdateBuildRevision >= VMMEM_SUFFIX_COBALT_RELEASE_UBR)));
 }
 
+bool wsl::windows::common::helpers::IsSmallPageMemorySupported(const WindowsVersion& Version)
+{
+    // These builds include the VID partition-teardown deadlock fix required for small-page backing.
+    return (Version.BuildNumber >= WindowsBuildNumbers::Germanium) ||
+           (Version.BuildNumber >= WindowsBuildNumbers::Cobalt && Version.UpdateBuildRevision >= 2360) ||
+           (Version.BuildNumber >= WindowsBuildNumbers::Iron && Version.UpdateBuildRevision >= 1970) ||
+           (Version.BuildNumber >= WindowsBuildNumbers::Vibranium_22H2 && Version.UpdateBuildRevision >= 3393);
+}
+
 bool wsl::windows::common::helpers::IsWindows11OrAbove()
 {
     return GetWindowsVersion().BuildNumber >= WindowsBuildNumbers::Cobalt;

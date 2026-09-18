@@ -1483,15 +1483,10 @@ std::wstring WslCoreVm::GenerateConfigJson()
     // N.B. Page reporting order must be >= fault cluster size shift.
     //
     // N.B. This is only done on builds that have the fix for the VID deadlock on partition teardown.
-    if ((m_windowsVersion.BuildNumber >= WindowsBuildNumbers::Germanium) ||
-        (m_windowsVersion.BuildNumber >= WindowsBuildNumbers::Cobalt && m_windowsVersion.UpdateBuildRevision >= 2360) ||
-        (m_windowsVersion.BuildNumber >= WindowsBuildNumbers::Iron && m_windowsVersion.UpdateBuildRevision >= 1970) ||
-        (m_windowsVersion.BuildNumber >= WindowsBuildNumbers::Vibranium_22H2 && m_windowsVersion.UpdateBuildRevision >= 3393))
+    if (helpers::IsSmallPageMemorySupported(m_windowsVersion))
     {
-        vmSettings.ComputeTopology.Memory.BackingPageSize = hcs::MemoryBackingPageSize::Small;
-        vmSettings.ComputeTopology.Memory.FaultClusterSizeShift = 4;          // 64k
-        vmSettings.ComputeTopology.Memory.DirectMapFaultClusterSizeShift = 4; // 64k
-        m_pageReportingOrder = 5;                                             // 128k
+        hcs::ConfigureSmallPageMemory(vmSettings.ComputeTopology.Memory, 4, 4); // 64k
+        m_pageReportingOrder = 5;                                               // 128k
     }
     else
     {
@@ -1582,16 +1577,7 @@ std::wstring WslCoreVm::GenerateConfigJson()
     {
         try
         {
-            if (wsl::windows::common::helpers::IsWindows11OrAbove())
-            {
-                const auto& processorFeatures = wsl::windows::common::hcs::GetProcessorFeatures();
-                auto feature = std::find(processorFeatures.begin(), processorFeatures.end(), "NestedVirt");
-                m_vmConfig.EnableNestedVirtualization = (feature != processorFeatures.end());
-            }
-            else
-            {
-                m_vmConfig.EnableNestedVirtualization = false;
-            }
+            m_vmConfig.EnableNestedVirtualization = hcs::IsNestedVirtualizationSupported();
 
             vmSettings.ComputeTopology.Processor.ExposeVirtualizationExtensions = m_vmConfig.EnableNestedVirtualization;
             if (!m_vmConfig.EnableNestedVirtualization)
@@ -1607,10 +1593,9 @@ std::wstring WslCoreVm::GenerateConfigJson()
     // Enable hardware performance counters if they are supported.
     if (m_vmConfig.EnableHardwarePerformanceCounters)
     {
-        HV_X64_HYPERVISOR_HARDWARE_FEATURES hardwareFeatures{};
-        __cpuid(reinterpret_cast<int*>(&hardwareFeatures), HvCpuIdFunctionMsHvHardwareFeatures);
-        vmSettings.ComputeTopology.Processor.EnablePerfmonPmu = hardwareFeatures.ChildPerfmonPmuSupported != 0;
-        vmSettings.ComputeTopology.Processor.EnablePerfmonLbr = hardwareFeatures.ChildPerfmonLbrSupported != 0;
+        const auto perfmon = hcs::GetPerfmonCapabilities();
+        vmSettings.ComputeTopology.Processor.EnablePerfmonPmu = perfmon.Pmu;
+        vmSettings.ComputeTopology.Processor.EnablePerfmonLbr = perfmon.Lbr;
     }
 
 #endif
@@ -1787,14 +1772,7 @@ std::wstring WslCoreVm::GenerateConfigJson()
     auto attachDisk = [&](PCWSTR path, bool grantVmAccess) {
         auto lun = ReserveLun();
         auto backingFile = OpenVhdBackingFile(path);
-        hcs::Attachment disk{};
-        disk.Type = hcs::AttachmentType::VirtualDisk;
-        disk.Path = path;
-        disk.ReadOnly = true;
-        disk.SupportCompressedVolumes = true;
-        disk.AlwaysAllowSparseFiles = true;
-        disk.SupportEncryptedFiles = true;
-        scsiController.Attachments[std::to_string(lun)] = std::move(disk);
+        scsiController.Attachments[std::to_string(lun)] = hcs::CreateVhdAttachment(path, true);
 
         DiskStateFlags diskFlags{};
         if (grantVmAccess)
@@ -1825,16 +1803,7 @@ std::wstring WslCoreVm::GenerateConfigJson()
     vmSettings.Devices.Scsi["0"] = std::move(scsiController);
 
     // Construct a security descriptor that allows system and the current user.
-    wil::unique_hlocal_string userSidString;
-    THROW_LAST_ERROR_IF(!ConvertSidToStringSidW(&m_userSid.Sid, &userSidString));
-
-    std::wstring securityDescriptor{L"D:P(A;;FA;;;SY)(A;;FA;;;"};
-    securityDescriptor += userSidString.get();
-    securityDescriptor += L")";
-    hcs::HvSocket hvSocketConfig{};
-    hvSocketConfig.HvSocketConfig.DefaultBindSecurityDescriptor = securityDescriptor;
-    hvSocketConfig.HvSocketConfig.DefaultConnectSecurityDescriptor = securityDescriptor;
-    vmSettings.Devices.HvSocket = std::move(hvSocketConfig);
+    vmSettings.Devices.HvSocket = hcs::CreateHvSocketConfiguration(&m_userSid.Sid);
 
     // N.B. Plan9 device is always added during serialization
 

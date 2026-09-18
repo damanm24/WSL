@@ -2,7 +2,10 @@
 
 #include "precomp.h"
 #include "HcsVirtualMachineBackend.h"
+#include "hvsocket.hpp"
 #include <set>
+
+namespace validation = wsl::windows::common::vm::validation;
 
 namespace {
 
@@ -13,14 +16,6 @@ constexpr UINT64 c_mib = 1024 * 1024;
 constexpr UINT64 c_memoryGranularity = 2 * c_mib;
 constexpr UINT32 c_maximumDisks = 254;
 constexpr HRESULT c_notSupported = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-
-void ValidatePath(const std::filesystem::path& Path)
-{
-    THROW_HR_IF_MSG(
-        E_INVALIDARG,
-        Path.empty() || !Path.is_absolute() || Path.native().find(L'\0') != std::wstring::npos,
-        "HCS requires an absolute, nonempty host path");
-}
 
 bool ResolveFeature(VmFeatureRequest Request, bool Supported)
 {
@@ -38,10 +33,36 @@ bool ResolveFeature(VmFeatureRequest Request, bool Supported)
     THROW_HR(E_INVALIDARG);
 }
 
-void ValidateConsolePath(const std::filesystem::path& Path)
+bool ResolveSelection(VmSelectionPolicy Policy, bool Supported)
 {
-    ValidatePath(Path);
-    THROW_HR_IF(E_INVALIDARG, !Path.native().starts_with(L"\\\\.\\pipe\\") || Path.filename().empty());
+    THROW_HR_IF(E_INVALIDARG, Policy != VmSelectionPolicy::Required && Policy != VmSelectionPolicy::Preferred);
+    THROW_HR_IF(c_notSupported, Policy == VmSelectionPolicy::Required && !Supported);
+    return Supported;
+}
+
+std::wstring GetVmbFsPath(const std::filesystem::path& Path, const std::filesystem::path& Root)
+{
+    const auto path = Path.lexically_normal();
+    const auto root = Root.lexically_normal();
+    auto position = path.begin();
+    for (const auto& component : root)
+    {
+        if (component.empty())
+        {
+            continue;
+        }
+
+        THROW_HR_IF(E_INVALIDARG, position == path.end() || _wcsicmp(component.c_str(), position->c_str()) != 0);
+        ++position;
+    }
+
+    std::filesystem::path relative;
+    for (; position != path.end(); ++position)
+    {
+        relative /= *position;
+    }
+    THROW_HR_IF(E_INVALIDARG, relative.empty() || relative.filename().empty());
+    return L"\\" + relative.native();
 }
 
 } // namespace
@@ -52,10 +73,10 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
     THROW_HR_IF(E_INVALIDARG, Request.Owner.empty() || Request.Owner.find(L'\0') != std::wstring::npos);
     THROW_HR_IF(E_INVALIDARG, Request.Processor.Count == 0 || Request.Memory.SizeBytes == 0);
     THROW_HR_IF(E_INVALIDARG, Request.Memory.SizeBytes % c_memoryGranularity != 0);
-    ValidatePath(Request.Boot.KernelPath);
+    validation::ValidatePath(Request.Boot.KernelPath, L"HCS");
     if (!Request.Boot.InitrdPath.empty())
     {
-        ValidatePath(Request.Boot.InitrdPath);
+        validation::ValidatePath(Request.Boot.InitrdPath, L"HCS");
     }
     THROW_HR_IF(E_INVALIDARG, Request.Boot.KernelCommandLine.find(L'\0') != std::wstring::npos);
 
@@ -77,59 +98,70 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
     settings.Owner = Request.Owner;
     settings.ShouldTerminateOnLastHandleClosed = true;
     const bool windows11 = helpers::IsWindows11OrAbove();
-    settings.SchemaVersion = {2, windows11 ? 7u : 3u};
+    settings.SchemaVersion = {2, 3};
     auto& vm = settings.VirtualMachine;
     vm.StopOnReset = true;
     vm.Chipset.UseUtc = true;
-    vm.Devices.Plan9.reset();
-    vm.Devices.Battery.reset();
+    if (!Request.EnablePlan9)
+    {
+        vm.Devices.Plan9.reset();
+    }
+    if (!Request.EnableBattery)
+    {
+        vm.Devices.Battery.reset();
+    }
     switch (description.Boot.Method)
     {
     case VmBootMethod::LinuxDirect:
         THROW_HR_IF(c_notSupported, wsl::shared::Arm64);
+        THROW_HR_IF(E_INVALIDARG, Request.Boot.UefiRootPath.has_value());
         vm.Chipset.LinuxKernelDirect =
             schema::LinuxKernelDirect{Request.Boot.KernelPath.native(), Request.Boot.InitrdPath.native(), Request.Boot.KernelCommandLine};
         break;
     case VmBootMethod::Uefi:
-        // Firmware resolves initrd paths relative to this directory; it does not consume InitRdPath.
-        THROW_HR_IF(
-            E_INVALIDARG,
-            !Request.Boot.InitrdPath.empty() && _wcsicmp(
-                                                    Request.Boot.InitrdPath.parent_path().lexically_normal().c_str(),
-                                                    Request.Boot.KernelPath.parent_path().lexically_normal().c_str()) != 0);
+    {
+        const auto root = Request.Boot.UefiRootPath.value_or(Request.Boot.KernelPath.parent_path());
+        validation::ValidatePath(root, L"HCS");
+        // Firmware consumes the caller's initrd= argument, not InitrdPath.
+        if (!Request.Boot.InitrdPath.empty())
+        {
+            GetVmbFsPath(Request.Boot.InitrdPath, root);
+        }
         vm.Chipset.Uefi = schema::Uefi{schema::UefiBootEntry{
             schema::UefiBootDevice::VmbFs,
-            Request.Boot.KernelPath.parent_path().native(),
-            L"\\" + Request.Boot.KernelPath.filename().native(),
+            root.lexically_normal().native(),
+            GetVmbFsPath(Request.Boot.KernelPath, root),
             Request.Boot.KernelCommandLine}};
         break;
+    }
     default:
         THROW_HR(E_INVALIDARG);
     }
 
     bool nestedVirtualization = false;
-    if (Request.Processor.NestedVirtualization != VmFeatureRequest::Disabled && windows11)
+    if (Request.Processor.NestedVirtualization != VmFeatureRequest::Disabled)
     {
-        const auto& features = schema::GetProcessorFeatures();
-        nestedVirtualization = std::find(features.begin(), features.end(), "NestedVirt") != features.end();
+        nestedVirtualization = schema::IsNestedVirtualizationSupported();
     }
     description.Processor.NestedVirtualization = ResolveFeature(Request.Processor.NestedVirtualization, nestedVirtualization);
 
-    bool pmu = false;
-    bool lbr = false;
-#ifdef _AMD64_
-    HV_X64_HYPERVISOR_HARDWARE_FEATURES hardwareFeatures{};
-    __cpuid(reinterpret_cast<int*>(&hardwareFeatures), HvCpuIdFunctionMsHvHardwareFeatures);
-    pmu = hardwareFeatures.ChildPerfmonPmuSupported != 0;
-    lbr = hardwareFeatures.ChildPerfmonLbrSupported != 0;
-#endif
-    description.Processor.PerfmonPmu = ResolveFeature(Request.Processor.PerfmonPmu, pmu);
-    description.Processor.PerfmonLbr = ResolveFeature(Request.Processor.PerfmonLbr, lbr);
+    const auto perfmon = schema::GetPerfmonCapabilities();
+    description.Processor.PerfmonPmu = ResolveFeature(Request.Processor.PerfmonPmu, perfmon.Pmu);
+    description.Processor.PerfmonLbr = ResolveFeature(Request.Processor.PerfmonLbr, perfmon.Lbr);
     auto& processor = vm.ComputeTopology.Processor;
     processor.Count = description.Processor.Count;
-    processor.ExposeVirtualizationExtensions = description.Processor.NestedVirtualization;
-    processor.EnablePerfmonPmu = description.Processor.PerfmonPmu;
-    processor.EnablePerfmonLbr = description.Processor.PerfmonLbr;
+    if (Request.Processor.NestedVirtualization != VmFeatureRequest::Disabled)
+    {
+        processor.ExposeVirtualizationExtensions = description.Processor.NestedVirtualization;
+    }
+    if (Request.Processor.PerfmonPmu != VmFeatureRequest::Disabled)
+    {
+        processor.EnablePerfmonPmu = description.Processor.PerfmonPmu;
+    }
+    if (Request.Processor.PerfmonLbr != VmFeatureRequest::Disabled)
+    {
+        processor.EnablePerfmonLbr = description.Processor.PerfmonLbr;
+    }
 
     description.Memory.AllowOvercommit = ResolveFeature(Request.Memory.AllowOvercommit, true);
     description.Memory.DeferredCommit = ResolveFeature(Request.Memory.DeferredCommit, true);
@@ -141,13 +173,53 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
     memory.EnableDeferredCommit = description.Memory.DeferredCommit;
     memory.EnableColdDiscardHint = description.Memory.ColdDiscard;
 
+    if (Request.Memory.SmallPages)
+    {
+        const auto& smallPages = *Request.Memory.SmallPages;
+        if (ResolveSelection(smallPages.Policy, helpers::IsSmallPageMemorySupported(helpers::GetWindowsVersion())))
+        {
+            schema::ConfigureSmallPageMemory(memory, smallPages.FaultClusterSizeShift, smallPages.DirectMapFaultClusterSizeShift);
+            description.Memory.SmallPages = true;
+            description.Memory.FaultClusterSizeShift = memory.FaultClusterSizeShift;
+            description.Memory.DirectMapFaultClusterSizeShift = memory.DirectMapFaultClusterSizeShift;
+        }
+    }
+
+    if (Request.Memory.Mmio)
+    {
+        const auto& mmio = *Request.Memory.Mmio;
+        THROW_HR_IF(E_INVALIDARG, mmio.HighWindowSizeBytes == 0 || mmio.HighWindowSizeBytes % c_mib != 0);
+        memory.HighMmioGapInMB = mmio.HighWindowSizeBytes / c_mib;
+        description.Memory.HighMmioSizeBytes = mmio.HighWindowSizeBytes;
+        if (mmio.MaximumGuestAddressBits)
+        {
+            const auto bits = *mmio.MaximumGuestAddressBits;
+            THROW_HR_IF(E_INVALIDARG, bits <= 32 || bits >= 64);
+            const UINT64 addressLimit = UINT64{1} << bits;
+            THROW_HR_IF(E_INVALIDARG, mmio.HighWindowSizeBytes > addressLimit - (UINT64{1} << 32));
+            const auto base = addressLimit - mmio.HighWindowSizeBytes;
+            memory.HighMmioBaseInMB = base / c_mib;
+            description.Memory.HighMmioBaseBytes = base;
+        }
+    }
+
+    if (Request.HostingProcessNameSuffix)
+    {
+        const auto& suffix = *Request.HostingProcessNameSuffix;
+        THROW_HR_IF(E_INVALIDARG, suffix.Value.empty() || suffix.Value.find(L'\0') != std::wstring::npos);
+        if (ResolveSelection(suffix.Policy, helpers::IsVmemmSuffixSupported()))
+        {
+            memory.HostingProcessNameSuffix = suffix.Value;
+        }
+    }
+
     std::set<std::wstring> consoleNames;
     for (const auto& console : Request.Consoles)
     {
         if (const auto* serial = std::get_if<VmSerialConsole>(&console.Device))
         {
-            ValidateConsolePath(serial->NamedPipe);
-            THROW_HR_IF(E_INVALIDARG, serial->Port > 1 || (wsl::shared::Arm64 && serial->Port != 0));
+            validation::ValidateConsolePath(serial->NamedPipe, L"HCS", E_INVALIDARG, true);
+            THROW_HR_IF(E_INVALIDARG, serial->Port > 1);
             THROW_HR_IF(
                 E_INVALIDARG,
                 !vm.Devices.ComPorts.emplace(std::to_string(serial->Port), schema::ComPort{serial->NamedPipe.native()}).second);
@@ -156,7 +228,7 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
         {
             const auto& virtio = std::get<VmVirtioConsole>(console.Device);
             THROW_HR_IF(c_notSupported, !helpers::IsVirtioSerialConsoleSupported());
-            ValidateConsolePath(virtio.NamedPipe);
+            validation::ValidateConsolePath(virtio.NamedPipe, L"HCS", E_INVALIDARG, true);
             THROW_HR_IF(E_INVALIDARG, virtio.GuestName.find(L'\0') != std::wstring::npos);
             THROW_HR_IF(E_INVALIDARG, !consoleNames.emplace(virtio.GuestName).second);
             if (!vm.Devices.VirtioSerial)
@@ -211,18 +283,14 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
         attachment.ReadOnly = disk.Disk.ReadOnly;
         if (const auto* source = std::get_if<VmVirtualDiskSource>(&disk.Disk.Source))
         {
-            ValidatePath(source->Path);
+            validation::ValidatePath(source->Path, L"HCS");
             THROW_HR_IF(E_INVALIDARG, source->Format != VmDiskFormat::Vhd && source->Format != VmDiskFormat::Vhdx);
-            attachment.Type = schema::AttachmentType::VirtualDisk;
-            attachment.Path = source->Path.native();
-            attachment.SupportCompressedVolumes = true;
-            attachment.AlwaysAllowSparseFiles = true;
-            attachment.SupportEncryptedFiles = true;
+            attachment = schema::CreateVhdAttachment(source->Path.c_str(), disk.Disk.ReadOnly);
         }
         else
         {
             const auto& physical = std::get<VmPhysicalDiskSource>(disk.Disk.Source);
-            ValidatePath(physical.DevicePath);
+            validation::ValidatePath(physical.DevicePath, L"HCS");
             attachment.Type = schema::AttachmentType::PassThru;
             attachment.Path = physical.DevicePath;
         }
@@ -232,21 +300,15 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
 
     if (Request.CrashCapture)
     {
-        THROW_HR_IF(E_INVALIDARG, Request.CrashCapture->Policy != VmSelectionPolicy::Required && Request.CrashCapture->Policy != VmSelectionPolicy::Preferred);
-        ValidatePath(Request.CrashCapture->SavedStatePath);
-        THROW_HR_IF(c_notSupported, !windows11 && Request.CrashCapture->Policy == VmSelectionPolicy::Required);
-        if (windows11)
+        validation::ValidatePath(Request.CrashCapture->SavedStatePath, L"HCS");
+        if (ResolveSelection(Request.CrashCapture->Policy, windows11))
         {
             vm.DebugOptions.BugcheckSavedStateFileName = Request.CrashCapture->SavedStatePath.native();
         }
     }
 
     const auto tokenUser = wil::get_token_information<TOKEN_USER>(Request.Identity.UserToken.get());
-    wil::unique_hlocal_string userSid;
-    THROW_IF_WIN32_BOOL_FALSE(ConvertSidToStringSidW(tokenUser->User.Sid, &userSid));
-    const auto securityDescriptor = std::format(L"D:P(A;;FA;;;SY)(A;;FA;;;{})", userSid.get());
-    vm.Devices.HvSocket.HvSocketConfig.DefaultBindSecurityDescriptor = securityDescriptor;
-    vm.Devices.HvSocket.HvSocketConfig.DefaultConnectSecurityDescriptor = securityDescriptor;
+    vm.Devices.HvSocket = schema::CreateHvSocketConfiguration(tokenUser->User.Sid);
     return configuration;
 }
 
@@ -267,9 +329,10 @@ void HcsVirtualMachineBackend::Initialize(const VmCreateRequest& Request)
 {
     auto configuration = wsl::windows::common::vm::hcs::BuildConfiguration(Request);
     const auto id = wsl::shared::string::GuidToString<wchar_t>(Request.Identity.VmId, wsl::shared::string::GuidToStringFlags::None);
-    const auto json = wsl::shared::ToJsonW(configuration.Settings);
+    m_state->m_configuration = wsl::shared::ToJsonW(configuration.Settings);
     m_state->m_description = std::move(configuration.Description);
-    m_state->m_system = schema::CreateComputeSystem(id.c_str(), json.c_str());
+    auto lock = m_state->m_lock.lock_exclusive();
+    m_state->m_system = schema::CreateComputeSystem(id.c_str(), m_state->m_configuration.c_str());
     schema::RegisterCallback(m_state->m_system.get(), OnSystemEvent, m_state.get());
 }
 
@@ -294,52 +357,143 @@ VmPlatformCapabilities HcsVirtualMachineBackend::GetCapabilities() const
 
 wil::unique_handle HcsVirtualMachineBackend::GetTerminationEvent() const
 {
-    THROW_HR(E_NOTIMPL);
+    wil::unique_handle event;
+    THROW_IF_WIN32_BOOL_FALSE(DuplicateHandle(
+        GetCurrentProcess(), m_state->m_terminatingEvent.get(), GetCurrentProcess(), event.put(), 0, FALSE, DUPLICATE_SAME_ACCESS));
+    return event;
 }
 
 void HcsVirtualMachineBackend::Start()
 {
-    THROW_HR(E_NOTIMPL);
+    auto lock = m_state->m_lock.lock_exclusive();
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
+    schema::StartComputeSystem(m_state->m_system.get(), m_state->m_configuration.c_str());
 }
 
 void HcsVirtualMachineBackend::Terminate()
 {
-    THROW_HR(E_NOTIMPL);
+    auto lock = m_state->m_lock.lock_exclusive();
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
+    schema::TerminateComputeSystem(m_state->m_system.get());
+    m_state->m_system.reset();
+    CloseGuestListeners();
+    // A system terminated before Start may not send an exit notification.
+    m_state->m_terminatingEvent.SetEvent();
 }
 
 void HcsVirtualMachineBackend::CancelPendingOperations() noexcept
 {
-    LOG_HR(E_NOTIMPL);
+    CloseGuestListeners();
 }
 
 VmGuestListener HcsVirtualMachineBackend::CreateGuestListener(GuestServicePort Port)
 {
-    THROW_HR(E_NOTIMPL);
+    auto lock = m_state->m_lock.lock_exclusive();
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
+    return RegisterGuestListener(m_state->m_description.Identity, Port);
 }
 
 wil::unique_socket HcsVirtualMachineBackend::AcceptGuestConnection(VmListenerId Listener)
 {
-    THROW_HR(E_NOTIMPL);
+    return AcceptGuestListenerConnection(Listener, m_state->m_description.Identity);
 }
 
 wil::unique_socket HcsVirtualMachineBackend::ConnectGuest(GuestServicePort Port)
 {
-    THROW_HR(E_NOTIMPL);
+    auto lock = m_state->m_lock.lock_shared();
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
+    return wsl::windows::common::hvsocket::Connect(m_state->m_description.Identity.VmId, Port.Value);
 }
 
 void HcsVirtualMachineBackend::CloseGuestListener(VmListenerId Listener)
 {
-    THROW_HR(E_NOTIMPL);
+    RemoveGuestListener(Listener, m_state->m_description.Identity);
 }
 
 VmDiskAttachment HcsVirtualMachineBackend::AttachDisk(const VmDiskRequest& Request)
 {
-    THROW_HR(E_NOTIMPL);
+    const auto* virtualDisk = std::get_if<VmVirtualDiskSource>(&Request.Source);
+    if (virtualDisk != nullptr)
+    {
+        validation::ValidatePath(virtualDisk->Path, L"HCS");
+        THROW_HR_IF(E_INVALIDARG, virtualDisk->Format != VmDiskFormat::Vhd && virtualDisk->Format != VmDiskFormat::Vhdx);
+    }
+    else
+    {
+        validation::ValidatePath(std::filesystem::path{std::get<VmPhysicalDiskSource>(Request.Source).DevicePath}, L"HCS");
+    }
+
+    if (Request.Placement)
+    {
+        THROW_HR_IF(
+            c_notSupported, Request.Placement->Address.Controller != 0 || Request.Placement->Address.Lun >= c_maximumDisks);
+    }
+
+    auto lock = m_state->m_lock.lock_exclusive();
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
+    const auto lunInUse = [&](std::uint32_t Lun) {
+        for (const auto& entry : m_state->m_description.BootDisks)
+        {
+            if (entry.second.GuestAddress.Lun == Lun)
+            {
+                return true;
+            }
+        }
+
+        for (const auto& entry : m_state->m_attachedDisks)
+        {
+            if (entry.second.Attachment.GuestAddress.Lun == Lun)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    std::uint32_t lun = 0;
+    if (Request.Placement)
+    {
+        lun = Request.Placement->Address.Lun;
+        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), lunInUse(lun));
+    }
+    else
+    {
+        while (lun < c_maximumDisks && lunInUse(lun))
+        {
+            ++lun;
+        }
+        THROW_HR_IF(WSL_E_TOO_MANY_DISKS_ATTACHED, lun == c_maximumDisks);
+    }
+
+    THROW_HR_IF(E_BOUNDS, m_state->m_nextDiskId == UINT64_MAX);
+    const VmDiskAttachment attachment{{m_state->m_description.Identity, m_state->m_nextDiskId}, {0, lun}, Request.ReadOnly};
+    const auto [disk, inserted] = m_state->m_attachedDisks.emplace(attachment.Id.Value, State::AttachedDisk{attachment});
+    WI_ASSERT(inserted);
+    auto rollback = wil::scope_exit([&] { m_state->m_attachedDisks.erase(disk); });
+    if (virtualDisk != nullptr)
+    {
+        schema::AddVhd(m_state->m_system.get(), virtualDisk->Path.c_str(), lun, Request.ReadOnly);
+    }
+    else
+    {
+        const auto& physicalDisk = std::get<VmPhysicalDiskSource>(Request.Source);
+        schema::AddPassThroughDisk(m_state->m_system.get(), physicalDisk.DevicePath.c_str(), lun, Request.ReadOnly);
+    }
+    ++m_state->m_nextDiskId;
+    rollback.release();
+    return attachment;
 }
 
 void HcsVirtualMachineBackend::DetachDisk(VmDiskId Disk)
 {
-    THROW_HR(E_NOTIMPL);
+    validation::ValidateResourceId(Disk, m_state->m_description.Identity);
+    auto lock = m_state->m_lock.lock_exclusive();
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
+    const auto disk = m_state->m_attachedDisks.find(Disk.Value);
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), disk == m_state->m_attachedDisks.end());
+    schema::RemoveScsiDisk(m_state->m_system.get(), disk->second.Attachment.GuestAddress.Lun);
+    m_state->m_attachedDisks.erase(disk);
 }
 
 VmFileSystemDevice HcsVirtualMachineBackend::CreateFileSystemDevice(const VmFileSystemDeviceRequest& Request)

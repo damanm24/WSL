@@ -137,6 +137,37 @@ class OpenVmmVirtualMachineBackendTests
         VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
     }
 
+    TEST_METHOD(RejectsUnsupportedCreationControls)
+    {
+        SKIP_TEST_ARM64();
+        auto request = CreateRequest();
+        request.Memory.Mmio = VmMmioRequest{16 * 1024 * c_mib, 36};
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+        request.Memory.Mmio.reset();
+        request.Memory.SmallPages = VmSmallPageMemoryRequest{};
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+        request.Memory.SmallPages->Policy = VmSelectionPolicy::Preferred;
+        VERIFY_IS_FALSE(ValidateCreateRequest(request).Memory.SmallPages);
+        request.Memory.SmallPages->Policy = static_cast<VmSelectionPolicy>(100);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
+        request.Memory.SmallPages.reset();
+        request.HostingProcessNameSuffix = VmRequestedValue<std::wstring>{L"CallerVm"};
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+        request.HostingProcessNameSuffix->Policy = VmSelectionPolicy::Preferred;
+        VERIFY_SUCCEEDED(DescribeResult(request));
+        request.HostingProcessNameSuffix->Value.clear();
+        VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
+        request.HostingProcessNameSuffix.reset();
+        request.EnablePlan9 = true;
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+        request.EnablePlan9 = false;
+        request.EnableBattery = true;
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+        request.EnableBattery = false;
+        request.Boot.UefiRootPath = L"C:\\images";
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+    }
+
     TEST_METHOD(EnforcesDiskLimitsAndKeepsIdsVmScoped)
     {
         SKIP_TEST_ARM64();

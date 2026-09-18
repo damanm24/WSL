@@ -179,6 +179,13 @@ struct VmGuestListener
     GuestServicePort Port;
 };
 
+struct VmGuestListenerState
+{
+    VmGuestListener Listener;
+    wil::unique_socket Socket;
+    wil::unique_event CancellationEvent{wil::EventOptions::ManualReset};
+};
+
 struct VmProcessorRequest
 {
     std::uint32_t Count = 0;
@@ -189,8 +196,17 @@ struct VmProcessorRequest
 
 struct VmMmioRequest
 {
+    // A nonzero, MiB-aligned window. Without an address limit, the host chooses its base.
     std::uint64_t HighWindowSizeBytes = 0;
     std::optional<std::uint8_t> MaximumGuestAddressBits;
+};
+
+struct VmSmallPageMemoryRequest
+{
+    // Shifts are relative to 4-KiB pages. The caller must coordinate guest page-reporting settings.
+    std::uint32_t FaultClusterSizeShift = 4;
+    std::uint32_t DirectMapFaultClusterSizeShift = 4;
+    VmSelectionPolicy Policy = VmSelectionPolicy::Required;
 };
 
 struct VmMemoryRequest
@@ -199,6 +215,8 @@ struct VmMemoryRequest
     VmFeatureRequest AllowOvercommit = VmFeatureRequest::Disabled;
     VmFeatureRequest DeferredCommit = VmFeatureRequest::Disabled;
     VmFeatureRequest ColdDiscard = VmFeatureRequest::Disabled;
+    std::optional<VmSmallPageMemoryRequest> SmallPages;
+    std::optional<VmMmioRequest> Mmio;
 };
 
 enum class VmBootMethod
@@ -210,12 +228,14 @@ enum class VmBootMethod
 
 struct VmLinuxBootRequest
 {
-    // Paths must already be accessible to the VM host. For UEFI, the kernel directory is
-    // exposed through VmbFs; the caller supplies any initrd= argument for an initrd in that directory.
+    // Paths must already be accessible to the VM host. For UEFI, both files must be under
+    // UefiRootPath (the kernel directory by default); the caller supplies the root-relative initrd= argument.
     std::filesystem::path KernelPath;
     std::filesystem::path InitrdPath;
     VmBootMethod Method = VmBootMethod::Automatic;
+    // Passed verbatim to direct boot or UEFI OptionalData; no guest/product arguments are appended.
     std::wstring KernelCommandLine;
+    std::optional<std::filesystem::path> UefiRootPath;
 };
 
 enum class VmConsoleRole
@@ -318,6 +338,9 @@ struct VmCreateRequest
     std::vector<VmBootDiskRequest> BootDisks;
     std::vector<VmConsoleRequest> Consoles;
     std::optional<VmCrashCaptureRequest> CrashCapture;
+    std::optional<VmRequestedValue<std::wstring>> HostingProcessNameSuffix;
+    bool EnablePlan9 = false;
+    bool EnableBattery = false;
 };
 
 struct VmEffectiveProcessor
@@ -334,6 +357,9 @@ struct VmEffectiveMemory
     bool AllowOvercommit = false;
     bool DeferredCommit = false;
     bool ColdDiscard = false;
+    bool SmallPages = false;
+    std::optional<std::uint32_t> FaultClusterSizeShift;
+    std::optional<std::uint32_t> DirectMapFaultClusterSizeShift;
     std::optional<std::uint64_t> HighMmioBaseBytes;
     std::optional<std::uint64_t> HighMmioSizeBytes;
 };
@@ -491,6 +517,24 @@ struct VmFileSystemShare
     bool ReadOnly = true;
 };
 
+namespace wsl::windows::common::vm::validation {
+
+void ValidateFeature(VmFeatureRequest Request, PCWSTR Setting);
+void ValidateUnsupportedSelection(VmSelectionPolicy Policy);
+void ValidatePath(const std::filesystem::path& Path, PCWSTR Backend);
+const VmVirtualDiskSource& ValidateDiskRequest(const VmDiskRequest& Request, UINT32 MaximumDisks);
+void ValidateConsolePath(const std::filesystem::path& Path, PCWSTR Backend, HRESULT Error, bool RequireName);
+void ValidateName(std::wstring_view Name, PCWSTR Description);
+void ValidateResourceId(UINT64 Value, const GUID& VmId, const VmInstanceId& Owner);
+
+template <typename Tag>
+void ValidateResourceId(const VmResourceId<Tag>& Id, const VmInstanceId& Owner)
+{
+    ValidateResourceId(Id.Value, Id.Owner.VmId, Owner);
+}
+
+} // namespace wsl::windows::common::vm::validation
+
 class IVirtualMachineBackend
 {
 public:
@@ -517,6 +561,19 @@ public:
     virtual VmNetworkAttachment AddNetworkAdapter(const VmNetworkAdapterRequest& Request) = 0;
     virtual VmPortBinding BindPort(VmDeviceId Device, const VmPortBindingRequest& Request) = 0;
     virtual void UnbindPort(VmPortBindingId Binding) = 0;
+
+protected:
+    VmGuestListener RegisterGuestListener(const VmInstanceId& Identity, GuestServicePort Port);
+    wil::unique_socket AcceptGuestListenerConnection(VmListenerId Listener, const VmInstanceId& Identity) const;
+    std::shared_ptr<VmGuestListenerState> RemoveGuestListener(VmListenerId Listener, const VmInstanceId& Identity);
+    void CloseGuestListeners() noexcept;
+
+private:
+    virtual std::shared_ptr<VmGuestListenerState> ConfigureGuestListener(const VmGuestListener& Listener);
+
+    mutable wil::srwlock m_guestListenersLock;
+    _Guarded_by_(m_guestListenersLock) std::map<std::uint64_t, std::shared_ptr<VmGuestListenerState>> m_guestListeners;
+    _Guarded_by_(m_guestListenersLock) std::uint64_t m_nextListenerId = 1;
 };
 
 VmPlatformCapabilities QueryVirtualMachineBackendCapabilities(BackendKind Kind);

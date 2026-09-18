@@ -36,6 +36,23 @@ using unique_hcs_operation = wil::unique_any<HCS_OPERATION, decltype(&HcsCloseOp
 
 using unique_hcs_system = wil::unique_any<HCS_SYSTEM, decltype(&HcsCloseComputeSystem), HcsCloseComputeSystem>;
 
+struct PerfmonCapabilities
+{
+    bool Pmu = false;
+    bool Lbr = false;
+};
+
+bool IsNestedVirtualizationSupported();
+
+PerfmonCapabilities GetPerfmonCapabilities();
+
+// Callers check platform support and choose shifts consistent with their guest's page-reporting configuration.
+void ConfigureSmallPageMemory(Memory& Settings, uint32_t FaultClusterSizeShift, uint32_t DirectMapFaultClusterSizeShift);
+
+Attachment CreateVhdAttachment(_In_ PCWSTR Path, bool ReadOnly);
+
+HvSocket CreateHvSocketConfiguration(_In_ PSID UserSid);
+
 void AddPlan9Share(
     _In_ HCS_SYSTEM ComputeSystem,
     _In_ PCWSTR Name,
@@ -50,6 +67,8 @@ void RemovePlan9Share(_In_ HCS_SYSTEM ComputeSystem, _In_ PCWSTR AccessName, _In
 void AddVhd(_In_ HCS_SYSTEM ComputeSystem, _In_ PCWSTR VhdPath, _In_ ULONG Lun, _In_ bool ReadOnly = false);
 
 void AddPassThroughDisk(_In_ HCS_SYSTEM ComputeSystem, _In_ PCWSTR Disk, _In_ ULONG Lun);
+
+void AddPassThroughDisk(_In_ HCS_SYSTEM ComputeSystem, _In_ PCWSTR Disk, _In_ ULONG Lun, _In_ bool ReadOnly);
 
 unique_hcs_system CreateComputeSystem(_In_ PCWSTR Id, _In_ PCWSTR Configuration);
 

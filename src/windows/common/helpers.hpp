@@ -145,6 +145,8 @@ struct WindowsVersion
 
 WindowsVersion GetWindowsVersion();
 
+bool IsSmallPageMemorySupported(const WindowsVersion& Version);
+
 std::string GetWindowsVersionString();
 
 std::filesystem::path GetUserProfilePath(_In_opt_ HANDLE userToken = nullptr);

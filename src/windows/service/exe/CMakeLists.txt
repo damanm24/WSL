@@ -61,6 +61,7 @@ set(HEADERS
 
 add_library(virtualmachinebackend STATIC
     VirtualMachineBackend.cpp
+    IVirtualMachineBackend.cpp
     IVirtualMachineBackend.h
     OpenVmmVirtualMachineBackend.cpp
     OpenVmmVirtualMachineBackend.h

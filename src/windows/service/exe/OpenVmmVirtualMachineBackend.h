@@ -54,6 +54,8 @@ private:
     static void DestroyVm(WslOpenVmmVm* Vm) noexcept;
     using UniqueVm = wil::unique_any<WslOpenVmmVm*, decltype(&DestroyVm), DestroyVm>;
 
+    std::shared_ptr<VmGuestListenerState> ConfigureGuestListener(const VmGuestListener& Listener) override;
+
     struct State
     {
         struct AttachedDisk
@@ -62,14 +64,11 @@ private:
             wil::unique_hfile BackingFile;
         };
 
-        struct GuestListener
+        struct GuestListener : VmGuestListenerState
         {
             ~GuestListener() noexcept;
 
-            VmGuestListener Listener;
-            wil::unique_socket Socket;
             std::filesystem::path Path;
-            wil::unique_event CancellationEvent{wil::EventOptions::ManualReset};
         };
 
         struct FileSystemDevice
@@ -98,14 +97,10 @@ private:
         };
 
         wil::srwlock m_lock;
-        _Requires_lock_held_(m_lock)
-        void CloseGuestListeners() noexcept;
 
         VmDescription m_description;
         _Guarded_by_(m_lock) std::map<std::uint64_t, AttachedDisk> m_attachedDisks;
         _Guarded_by_(m_lock) std::uint64_t m_nextDiskId = 1;
-        _Guarded_by_(m_lock) std::map<std::uint64_t, std::shared_ptr<GuestListener>> m_guestListeners;
-        _Guarded_by_(m_lock) std::uint64_t m_nextListenerId = 1;
         _Guarded_by_(m_lock) std::map<std::uint64_t, FileSystemDevice> m_fileSystemDevices;
         _Guarded_by_(m_lock) std::map<std::uint64_t, FileSystemShare> m_fileSystemShares;
         _Guarded_by_(m_lock) std::map<std::uint64_t, NetworkAdapter> m_networkAdapters;

@@ -178,6 +178,13 @@ struct VmGuestListener
     GuestServicePort Port;
 };
 
+struct VmGuestListenerState
+{
+    VmGuestListener Listener;
+    wil::unique_socket Socket;
+    wil::unique_event CancellationEvent{wil::EventOptions::ManualReset};
+};
+
 struct VmProcessorRequest
 {
     std::uint32_t Count = 0;
@@ -486,6 +493,24 @@ struct VmFileSystemShare
     bool ReadOnly = true;
 };
 
+namespace wsl::windows::common::vm::validation {
+
+void ValidateFeature(VmFeatureRequest Request, PCWSTR Setting);
+void ValidateUnsupportedSelection(VmSelectionPolicy Policy);
+void ValidatePath(const std::filesystem::path& Path, PCWSTR Backend);
+const VmVirtualDiskSource& ValidateDiskRequest(const VmDiskRequest& Request, UINT32 MaximumDisks);
+void ValidateConsolePath(const std::filesystem::path& Path, PCWSTR Backend, HRESULT Error, bool RequireName);
+void ValidateName(std::wstring_view Name, PCWSTR Description);
+void ValidateResourceId(UINT64 Value, const GUID& VmId, const VmInstanceId& Owner);
+
+template <typename Tag>
+void ValidateResourceId(const VmResourceId<Tag>& Id, const VmInstanceId& Owner)
+{
+    ValidateResourceId(Id.Value, Id.Owner.VmId, Owner);
+}
+
+} // namespace wsl::windows::common::vm::validation
+
 class IVirtualMachineBackend
 {
 public:
@@ -512,6 +537,19 @@ public:
     virtual VmNetworkAttachment AddNetworkAdapter(const VmNetworkAdapterRequest& Request) = 0;
     virtual VmPortBinding BindPort(VmDeviceId Device, const VmPortBindingRequest& Request) = 0;
     virtual void UnbindPort(VmPortBindingId Binding) = 0;
+
+protected:
+    VmGuestListener RegisterGuestListener(const VmInstanceId& Identity, GuestServicePort Port);
+    wil::unique_socket AcceptGuestListenerConnection(VmListenerId Listener, const VmInstanceId& Identity) const;
+    std::shared_ptr<VmGuestListenerState> RemoveGuestListener(VmListenerId Listener, const VmInstanceId& Identity);
+    void CloseGuestListeners() noexcept;
+
+private:
+    virtual std::shared_ptr<VmGuestListenerState> ConfigureGuestListener(const VmGuestListener& Listener);
+
+    mutable wil::srwlock m_guestListenersLock;
+    _Guarded_by_(m_guestListenersLock) std::map<std::uint64_t, std::shared_ptr<VmGuestListenerState>> m_guestListeners;
+    _Guarded_by_(m_guestListenersLock) std::uint64_t m_nextListenerId = 1;
 };
 
 VmPlatformCapabilities QueryVirtualMachineBackendCapabilities(BackendKind Kind);

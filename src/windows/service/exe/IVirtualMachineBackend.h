@@ -26,6 +26,7 @@ enum class BackendKind
 struct VmInstanceId
 {
     GUID VmId{};
+    wil::shared_handle UserToken{};
 };
 
 template <typename Tag>
@@ -209,12 +210,12 @@ enum class VmBootMethod
 
 struct VmLinuxBootRequest
 {
+    // Paths must already be accessible to the VM host. For UEFI, the kernel directory is
+    // exposed through VmbFs; the caller supplies any initrd= argument for an initrd in that directory.
     std::filesystem::path KernelPath;
     std::filesystem::path InitrdPath;
     VmBootMethod Method = VmBootMethod::Automatic;
-    std::wstring GuestCommandLine;
-    std::wstring UserCommandLine;
-    std::optional<std::uint64_t> RequestedDmaBounceBufferBytes;
+    std::wstring KernelCommandLine;
 };
 
 enum class VmConsoleRole
@@ -237,6 +238,7 @@ struct VmVirtioConsole
     std::uint32_t Port = 0;
     std::wstring GuestName;
     std::filesystem::path NamedPipe;
+    bool ConsoleSupport = true;
 };
 
 struct VmConsoleRequest
@@ -299,13 +301,17 @@ struct VmDiskAttachment
 
 struct VmCrashCaptureRequest
 {
+    // The caller prepares the writable destination and owns its retention policy.
     std::filesystem::path SavedStatePath;
     VmSelectionPolicy Policy = VmSelectionPolicy::Required;
 };
 
 struct VmCreateRequest
 {
-    GUID VmId{};
+    // HCS uses UserToken to restrict host access to the VM's sockets.
+    // The caller prepares backing files and any VM access grants before creation.
+    VmInstanceId Identity;
+    std::wstring Owner = L"VirtualMachine";
     VmProcessorRequest Processor;
     VmMemoryRequest Memory;
     VmLinuxBootRequest Boot;
@@ -336,7 +342,6 @@ struct VmEffectiveBoot
 {
     VmBootMethod Method = VmBootMethod::Automatic;
     std::wstring KernelCommandLine;
-    std::optional<std::uint32_t> PageReportingOrder;
     std::vector<VmConsoleRequest> Consoles;
 };
 

@@ -190,23 +190,20 @@ void OpenVmmVirtualMachineBackend::State::CloseGuestListeners() noexcept
 
 VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmCreateRequest& Request)
 {
-    THROW_HR_IF(E_INVALIDARG, IsEqualGUID(Request.VmId, GUID_NULL));
+    THROW_HR_IF(E_INVALIDARG, IsEqualGUID(Request.Identity.VmId, GUID_NULL));
     THROW_HR_IF(E_INVALIDARG, Request.Processor.Count == 0 || Request.Memory.SizeBytes == 0);
     THROW_HR_IF_MSG(c_notSupported, wsl::shared::Arm64, "OpenVMM direct boot is currently supported only on x64");
     ValidatePath(Request.Boot.KernelPath);
     ValidatePath(Request.Boot.InitrdPath);
-    THROW_HR_IF(
-        E_INVALIDARG,
-        Request.Boot.GuestCommandLine.find(L'\0') != std::wstring::npos || Request.Boot.UserCommandLine.find(L'\0') != std::wstring::npos);
+    THROW_HR_IF(E_INVALIDARG, Request.Boot.KernelCommandLine.find(L'\0') != std::wstring::npos);
     THROW_HR_IF(
         E_INVALIDARG,
         Request.Boot.Method != VmBootMethod::Automatic && Request.Boot.Method != VmBootMethod::LinuxDirect &&
             Request.Boot.Method != VmBootMethod::Uefi);
     THROW_HR_IF(c_notSupported, Request.Boot.Method == VmBootMethod::Uefi);
-    THROW_HR_IF(c_notSupported, Request.Boot.RequestedDmaBounceBufferBytes.has_value());
 
     VmDescription description;
-    description.Identity.VmId = Request.VmId;
+    description.Identity = Request.Identity;
     description.Backend = BackendKind::OpenVmm;
     description.Processor.Count = Request.Processor.Count;
     description.Memory.SizeBytes = Request.Memory.SizeBytes;
@@ -230,15 +227,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
     }
 
     description.Boot.Method = VmBootMethod::LinuxDirect;
-    description.Boot.KernelCommandLine = Request.Boot.GuestCommandLine;
-    if (!Request.Boot.UserCommandLine.empty())
-    {
-        if (!description.Boot.KernelCommandLine.empty())
-        {
-            description.Boot.KernelCommandLine += L" ";
-        }
-        description.Boot.KernelCommandLine += Request.Boot.UserCommandLine;
-    }
+    description.Boot.KernelCommandLine = Request.Boot.KernelCommandLine;
 
     bool serialConfigured = false;
     bool virtioConfigured = false;
@@ -254,7 +243,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
         else
         {
             const auto& virtio = std::get<VmVirtioConsole>(console.Device);
-            THROW_HR_IF(c_notSupported, virtio.Port != 0 || !virtio.GuestName.empty());
+            THROW_HR_IF(c_notSupported, virtio.Port != 0 || !virtio.GuestName.empty() || !virtio.ConsoleSupport);
             THROW_HR_IF(E_INVALIDARG, virtioConfigured);
             ValidateConsolePath(virtio.NamedPipe);
             virtioConfigured = true;
@@ -362,7 +351,7 @@ void OpenVmmVirtualMachineBackend::Initialize(const VmCreateRequest& Request)
         "openvmm.exe not found at: %ls",
         executable.c_str());
 
-    auto id = wsl::shared::string::GuidToString<wchar_t>(Request.VmId, wsl::shared::string::GuidToStringFlags::None);
+    auto id = wsl::shared::string::GuidToString<wchar_t>(Request.Identity.VmId, wsl::shared::string::GuidToStringFlags::None);
     std::erase(id, L'-');
     // An exclusive directory creation prevents shortened path IDs from aliasing another VM.
     m_state->m_socketDirectory = filesystem::GetTempFolderPath(GetCurrentProcessToken()) / (L"ov-" + id.substr(0, 16));

@@ -3,6 +3,7 @@
 #include "precomp.h"
 #include "HcsVirtualMachineBackend.h"
 #include "hvsocket.hpp"
+#include <set>
 
 namespace validation = wsl::windows::common::vm::validation;
 
@@ -85,6 +86,7 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
     description.Processor.Count = Request.Processor.Count;
     description.Memory.SizeBytes = Request.Memory.SizeBytes;
     description.Boot.KernelCommandLine = Request.Boot.KernelCommandLine;
+    description.Boot.Consoles = Request.Consoles;
     description.Boot.Method = Request.Boot.Method;
     if (description.Boot.Method == VmBootMethod::Automatic)
     {
@@ -94,10 +96,19 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
     auto& settings = configuration.Settings;
     settings.Owner = Request.Owner;
     settings.ShouldTerminateOnLastHandleClosed = true;
+    const bool windows11 = helpers::IsWindows11OrAbove();
     settings.SchemaVersion = {2, 3};
     auto& vm = settings.VirtualMachine;
     vm.StopOnReset = true;
     vm.Chipset.UseUtc = true;
+    if (!Request.EnablePlan9)
+    {
+        vm.Devices.Plan9.reset();
+    }
+    if (!Request.EnableBattery)
+    {
+        vm.Devices.Battery.reset();
+    }
     switch (description.Boot.Method)
     {
     case VmBootMethod::LinuxDirect:
@@ -188,6 +199,56 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
             const auto base = addressLimit - mmio.HighWindowSizeBytes;
             memory.HighMmioBaseInMB = base / c_mib;
             description.Memory.HighMmioBaseBytes = base;
+        }
+    }
+
+    if (Request.HostingProcessNameSuffix)
+    {
+        const auto& suffix = *Request.HostingProcessNameSuffix;
+        THROW_HR_IF(E_INVALIDARG, suffix.Value.empty() || suffix.Value.find(L'\0') != std::wstring::npos);
+        if (ResolveSelection(suffix.Policy, helpers::IsVmemmSuffixSupported()))
+        {
+            memory.HostingProcessNameSuffix = suffix.Value;
+        }
+    }
+
+    std::set<std::wstring> consoleNames;
+    for (const auto& console : Request.Consoles)
+    {
+        if (const auto* serial = std::get_if<VmSerialConsole>(&console.Device))
+        {
+            validation::ValidateConsolePath(serial->NamedPipe, L"HCS", E_INVALIDARG, true);
+            THROW_HR_IF(E_INVALIDARG, serial->Port > 1);
+            THROW_HR_IF(
+                E_INVALIDARG,
+                !vm.Devices.ComPorts.emplace(std::to_string(serial->Port), schema::ComPort{serial->NamedPipe.native()}).second);
+        }
+        else
+        {
+            const auto& virtio = std::get<VmVirtioConsole>(console.Device);
+            THROW_HR_IF(c_notSupported, !helpers::IsVirtioSerialConsoleSupported());
+            validation::ValidateConsolePath(virtio.NamedPipe, L"HCS", E_INVALIDARG, true);
+            THROW_HR_IF(E_INVALIDARG, virtio.GuestName.find(L'\0') != std::wstring::npos);
+            THROW_HR_IF(E_INVALIDARG, !consoleNames.emplace(virtio.GuestName).second);
+            if (!vm.Devices.VirtioSerial)
+            {
+                vm.Devices.VirtioSerial.emplace();
+            }
+            THROW_HR_IF(
+                E_INVALIDARG,
+                !vm.Devices.VirtioSerial->Ports
+                     .emplace(
+                         std::to_string(virtio.Port), schema::VirtioSerialPort{virtio.GuestName, virtio.NamedPipe.native(), virtio.ConsoleSupport})
+                     .second);
+        }
+    }
+
+    if (Request.CrashCapture)
+    {
+        validation::ValidatePath(Request.CrashCapture->SavedStatePath, L"HCS");
+        if (ResolveSelection(Request.CrashCapture->Policy, windows11))
+        {
+            vm.DebugOptions.BugcheckSavedStateFileName = Request.CrashCapture->SavedStatePath.native();
         }
     }
 

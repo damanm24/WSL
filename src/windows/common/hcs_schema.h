@@ -509,8 +509,8 @@ struct Devices
 {
     std::optional<VirtioSerial> VirtioSerial;
     std::map<std::string, ComPort> ComPorts;
-    EmptyObject Plan9;
-    EmptyObject Battery;
+    std::optional<EmptyObject> Plan9{std::in_place};
+    std::optional<EmptyObject> Battery{std::in_place};
     HvSocket HvSocket;
     std::map<std::string, Scsi> Scsi;
     std::optional<VirtualPMemController> VirtualPMem;
@@ -518,13 +518,10 @@ struct Devices
 
 inline void to_json(nlohmann::json& j, const Devices& devices)
 {
-    j = nlohmann::json{
-        {"ComPorts", devices.ComPorts},
-        {"Plan9", devices.Plan9},
-        {"Battery", devices.Battery},
-        {"HvSocket", devices.HvSocket},
-        {"Scsi", devices.Scsi}};
+    j = nlohmann::json{{"ComPorts", devices.ComPorts}, {"HvSocket", devices.HvSocket}, {"Scsi", devices.Scsi}};
 
+    OMIT_IF_EMPTY(j, devices, Plan9);
+    OMIT_IF_EMPTY(j, devices, Battery);
     OMIT_IF_EMPTY(j, devices, VirtioSerial);
     OMIT_IF_EMPTY(j, devices, VirtualPMem);
 }

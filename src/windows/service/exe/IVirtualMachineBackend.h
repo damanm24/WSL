@@ -258,6 +258,7 @@ struct VmVirtioConsole
     std::uint32_t Port = 0;
     std::wstring GuestName;
     std::filesystem::path NamedPipe;
+    bool ConsoleSupport = true;
 };
 
 struct VmConsoleRequest
@@ -320,6 +321,7 @@ struct VmDiskAttachment
 
 struct VmCrashCaptureRequest
 {
+    // The caller prepares the writable destination and owns its retention policy.
     std::filesystem::path SavedStatePath;
     VmSelectionPolicy Policy = VmSelectionPolicy::Required;
 };
@@ -336,6 +338,9 @@ struct VmCreateRequest
     std::vector<VmBootDiskRequest> BootDisks;
     std::vector<VmConsoleRequest> Consoles;
     std::optional<VmCrashCaptureRequest> CrashCapture;
+    std::optional<VmRequestedValue<std::wstring>> HostingProcessNameSuffix;
+    bool EnablePlan9 = false;
+    bool EnableBattery = false;
 };
 
 struct VmEffectiveProcessor

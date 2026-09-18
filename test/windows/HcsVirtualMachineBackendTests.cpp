@@ -83,6 +83,27 @@ class HcsVirtualMachineBackendTests
         VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), wil::ResultFromException([&] { backend->Start(); }));
     }
 
+    WSL2_TEST_METHOD(StartsWithRequestedCreationSettings)
+    {
+        auto request = CreateRunnableRequest();
+        request.Memory.AllowOvercommit = VmFeatureRequest::Required;
+        request.Memory.DeferredCommit = VmFeatureRequest::Required;
+        request.Memory.ColdDiscard = VmFeatureRequest::Required;
+        request.Memory.SmallPages = VmSmallPageMemoryRequest{4, 4, VmSelectionPolicy::Preferred};
+        request.Memory.Mmio = VmMmioRequest{16 * c_gib, 36};
+        request.HostingProcessNameSuffix = VmRequestedValue<std::wstring>{L"BackendTest", VmSelectionPolicy::Preferred};
+        request.EnablePlan9 = true;
+        request.EnableBattery = true;
+        request.Boot.Method = VmBootMethod::Uefi;
+        request.Boot.UefiRootPath = request.Boot.KernelPath.parent_path();
+        auto backend = HcsVirtualMachineBackend::Create(request);
+        const auto terminationEvent = backend->GetTerminationEvent();
+        backend->Start();
+        VERIFY_ARE_EQUAL(static_cast<DWORD>(WAIT_TIMEOUT), WaitForSingleObject(terminationEvent.get(), 100));
+        backend->Terminate();
+        VERIFY_ARE_EQUAL(static_cast<DWORD>(WAIT_OBJECT_0), WaitForSingleObject(terminationEvent.get(), 0));
+    }
+
     TEST_METHOD(PreservesCallerInputsWithoutGuestPolicy)
     {
         const auto request = CreateRequest();
@@ -108,6 +129,13 @@ class HcsVirtualMachineBackendTests
         VERIFY_IS_FALSE(processor.contains("ExposeVirtualizationExtensions"));
         VERIFY_IS_FALSE(processor.contains("EnablePerfmonPmu"));
         VERIFY_IS_FALSE(processor.contains("EnablePerfmonLbr"));
+        VERIFY_IS_FALSE(json.at("VirtualMachine").at("Devices").contains("Plan9"));
+        VERIFY_IS_FALSE(json.at("VirtualMachine").at("Devices").contains("Battery"));
+        // Existing HCS callers retain their default devices.
+        const nlohmann::json defaultDevices = schema::Devices{};
+        VERIFY_IS_TRUE(defaultDevices.contains("Plan9"));
+        VERIFY_IS_TRUE(defaultDevices.contains("Battery"));
+
         if constexpr (wsl::shared::Arm64)
         {
             VERIFY_ARE_EQUAL(VmBootMethod::Uefi, description.Boot.Method);
@@ -207,6 +235,23 @@ class HcsVirtualMachineBackendTests
         }
     }
 
+    TEST_METHOD(EnablesOnlyRequestedDefaultDevices)
+    {
+        auto request = CreateRequest();
+        request.EnablePlan9 = true;
+        auto devices = BuildConfiguration(request).Settings.VirtualMachine.Devices;
+        VERIFY_IS_TRUE(devices.Plan9.has_value());
+        VERIFY_IS_FALSE(devices.Battery.has_value());
+        request.EnableBattery = true;
+        const nlohmann::json both = BuildConfiguration(request).Settings.VirtualMachine.Devices;
+        VERIFY_IS_TRUE(both.at("Plan9").is_object());
+        VERIFY_IS_TRUE(both.at("Battery").is_object());
+        request.EnablePlan9 = false;
+        devices = BuildConfiguration(request).Settings.VirtualMachine.Devices;
+        VERIFY_IS_FALSE(devices.Plan9.has_value());
+        VERIFY_IS_TRUE(devices.Battery.has_value());
+    }
+
     TEST_METHOD(UsesCallerMmioWindowAndAddressLimit)
     {
         auto request = CreateRequest();
@@ -290,6 +335,44 @@ class HcsVirtualMachineBackendTests
         VERIFY_IS_FALSE(supported(WindowsBuildNumbers::Cobalt, 0));
         VERIFY_IS_TRUE(supported(WindowsBuildNumbers::Cobalt, 2360));
         VERIFY_IS_TRUE(supported(WindowsBuildNumbers::Germanium, 0));
+    }
+
+    TEST_METHOD(UsesOnlyRequestedHostingProcessSuffix)
+    {
+        auto request = CreateRequest();
+        VERIFY_IS_FALSE(BuildConfiguration(request).Settings.VirtualMachine.ComputeTopology.Memory.HostingProcessNameSuffix.has_value());
+        request.HostingProcessNameSuffix = VmRequestedValue<std::wstring>{L"CallerVm", VmSelectionPolicy::Preferred};
+        const auto memory = BuildConfiguration(request).Settings.VirtualMachine.ComputeTopology.Memory;
+        const bool supported = helpers::IsVmemmSuffixSupported();
+        VERIFY_ARE_EQUAL(supported, memory.HostingProcessNameSuffix.has_value());
+        if (supported)
+        {
+            VERIFY_ARE_EQUAL(std::wstring{L"CallerVm"}, memory.HostingProcessNameSuffix.value());
+        }
+        request.HostingProcessNameSuffix->Policy = VmSelectionPolicy::Required;
+        VERIFY_ARE_EQUAL(supported ? S_OK : c_notSupported, ConfigurationResult(request));
+        request.HostingProcessNameSuffix->Value.push_back(L'\0');
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.HostingProcessNameSuffix->Value.clear();
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.HostingProcessNameSuffix->Value = L"CallerVm";
+        request.HostingProcessNameSuffix->Policy = static_cast<VmSelectionPolicy>(100);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+    }
+
+    TEST_METHOD(SupportsBothSerialPortsWithoutChangingGuestArguments)
+    {
+        auto request = CreateRequest();
+        request.Consoles = {
+            {VmConsoleRole::KernelConsole, VmSerialConsole{0, L"\\\\.\\pipe\\caller-console"}},
+            {VmConsoleRole::KernelDebugger, VmSerialConsole{1, L"\\\\.\\pipe\\caller-debugger"}}};
+        const auto configuration = BuildConfiguration(request);
+        VERIFY_ARE_EQUAL(size_t{2}, configuration.Settings.VirtualMachine.Devices.ComPorts.size());
+        VERIFY_ARE_EQUAL(
+            std::wstring{L"\\\\.\\pipe\\caller-debugger"}, configuration.Settings.VirtualMachine.Devices.ComPorts.at("1").NamedPipe);
+        VERIFY_ARE_EQUAL(request.Boot.KernelCommandLine, configuration.Description.Boot.KernelCommandLine);
+        std::get<VmSerialConsole>(request.Consoles[1].Device).Port = 2;
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
     }
 
     TEST_METHOD(RejectsInvalidInputsBeforeCreatingSystem)
@@ -376,6 +459,50 @@ class HcsVirtualMachineBackendTests
         request.Processor.PerfmonPmu = VmFeatureRequest::Preferred;
         request.Processor.PerfmonLbr = VmFeatureRequest::Required;
         VERIFY_ARE_EQUAL(lbr ? S_OK : c_notSupported, ConfigurationResult(request));
+    }
+
+    TEST_METHOD(UsesOnlyCallerProvidedCrashDestination)
+    {
+        auto request = CreateRequest();
+        request.CrashCapture = VmCrashCaptureRequest{L"C:\\dumps\\caller.vmrs", VmSelectionPolicy::Preferred};
+        const auto configuration = BuildConfiguration(request);
+        if (wsl::windows::common::helpers::IsWindows11OrAbove())
+        {
+            VERIFY_ARE_EQUAL(
+                request.CrashCapture->SavedStatePath.native(),
+                configuration.Settings.VirtualMachine.DebugOptions.BugcheckSavedStateFileName.value());
+        }
+        else
+        {
+            VERIFY_IS_FALSE(configuration.Settings.VirtualMachine.DebugOptions.BugcheckSavedStateFileName.has_value());
+            request.CrashCapture->Policy = VmSelectionPolicy::Required;
+            VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), ConfigurationResult(request));
+        }
+        request.CrashCapture->SavedStatePath = L"relative.vmrs";
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+    }
+
+    TEST_METHOD(DoesNotInferConsoleConfigurationFromRoles)
+    {
+        auto request = CreateRequest();
+        request.Consoles = {{VmConsoleRole::Telemetry, VmSerialConsole{0, L"\\\\.\\pipe\\caller-serial"}}};
+        const auto configuration = BuildConfiguration(request);
+        VERIFY_ARE_EQUAL(
+            std::wstring{L"\\\\.\\pipe\\caller-serial"}, configuration.Settings.VirtualMachine.Devices.ComPorts.at("0").NamedPipe);
+        VERIFY_ARE_EQUAL(request.Boot.KernelCommandLine, configuration.Description.Boot.KernelCommandLine);
+        request.Consoles.push_back(request.Consoles[0]);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.Consoles.pop_back();
+        std::get<VmSerialConsole>(request.Consoles[0].Device).NamedPipe = L"C:\\not-a-pipe";
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+
+        if (wsl::windows::common::helpers::IsVirtioSerialConsoleSupported())
+        {
+            request.Consoles = {{VmConsoleRole::KernelConsole, VmVirtioConsole{0, L"caller-port", L"\\\\.\\pipe\\caller-virtio", false}}};
+            const auto virtio = BuildConfiguration(request).Settings.VirtualMachine.Devices.VirtioSerial;
+            VERIFY_ARE_EQUAL(std::wstring{L"caller-port"}, virtio->Ports.at("0").Name);
+            VERIFY_IS_FALSE(virtio->Ports.at("0").ConsoleSupport);
+        }
     }
 };
 

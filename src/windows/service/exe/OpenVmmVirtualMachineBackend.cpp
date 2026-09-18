@@ -128,7 +128,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
             Request.Boot.Method != VmBootMethod::Uefi);
     THROW_HR_IF(c_notSupported, Request.Boot.Method == VmBootMethod::Uefi);
     THROW_HR_IF(c_notSupported, Request.Boot.UefiRootPath.has_value());
-    THROW_HR_IF(c_notSupported, Request.Memory.Mmio.has_value());
+    THROW_HR_IF(c_notSupported, Request.EnablePlan9 || Request.EnableBattery || Request.Memory.Mmio.has_value());
 
     VmDescription description;
     description.Identity = Request.Identity;
@@ -152,6 +152,11 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
     {
         validation::ValidateUnsupportedSelection(Request.Memory.SmallPages->Policy);
     }
+    if (Request.HostingProcessNameSuffix)
+    {
+        validation::ValidateName(Request.HostingProcessNameSuffix->Value, L"hosting process name suffix");
+        validation::ValidateUnsupportedSelection(Request.HostingProcessNameSuffix->Policy);
+    }
     if (Request.CrashCapture)
     {
         validation::ValidateUnsupportedSelection(Request.CrashCapture->Policy);
@@ -174,7 +179,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
         else
         {
             const auto& virtio = std::get<VmVirtioConsole>(console.Device);
-            THROW_HR_IF(c_notSupported, virtio.Port != 0 || !virtio.GuestName.empty());
+            THROW_HR_IF(c_notSupported, virtio.Port != 0 || !virtio.GuestName.empty() || !virtio.ConsoleSupport);
             THROW_HR_IF(E_INVALIDARG, virtioConfigured);
             validation::ValidateConsolePath(virtio.NamedPipe, L"OpenVMM", c_notSupported, false);
             virtioConfigured = true;

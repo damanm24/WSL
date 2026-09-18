@@ -2,7 +2,10 @@
 
 #include "precomp.h"
 #include "HcsVirtualMachineBackend.h"
+#include "disk.hpp"
 #include "hvsocket.hpp"
+#include "retryshared.h"
+#include "wslsecurity.h"
 #include <set>
 
 namespace validation = wsl::windows::common::vm::validation;
@@ -329,6 +332,8 @@ void HcsVirtualMachineBackend::Initialize(const VmCreateRequest& Request)
 {
     auto configuration = wsl::windows::common::vm::hcs::BuildConfiguration(Request);
     const auto id = wsl::shared::string::GuidToString<wchar_t>(Request.Identity.VmId, wsl::shared::string::GuidToStringFlags::None);
+    m_state->m_machineId =
+        wsl::shared::string::GuidToString<wchar_t>(Request.Identity.VmId, wsl::shared::string::GuidToStringFlags::Uppercase);
     m_state->m_configuration = wsl::shared::ToJsonW(configuration.Settings);
     m_state->m_description = std::move(configuration.Description);
     auto lock = m_state->m_lock.lock_exclusive();
@@ -413,6 +418,8 @@ void HcsVirtualMachineBackend::CloseGuestListener(VmListenerId Listener)
 VmDiskAttachment HcsVirtualMachineBackend::AttachDisk(const VmDiskRequest& Request)
 {
     const auto* virtualDisk = std::get_if<VmVirtualDiskSource>(&Request.Source);
+    const bool isPhysical = virtualDisk == nullptr;
+    const auto& path = isPhysical ? std::get<VmPhysicalDiskSource>(Request.Source).DevicePath : virtualDisk->Path.native();
     if (virtualDisk != nullptr)
     {
         validation::ValidatePath(virtualDisk->Path, L"HCS");
@@ -428,9 +435,37 @@ VmDiskAttachment HcsVirtualMachineBackend::AttachDisk(const VmDiskRequest& Reque
         THROW_HR_IF(
             c_notSupported, Request.Placement->Address.Controller != 0 || Request.Placement->Address.Lun >= c_maximumDisks);
     }
+    THROW_HR_IF(E_INVALIDARG, Request.OperationTimeout <= std::chrono::milliseconds::zero());
 
     auto lock = m_state->m_lock.lock_exclusive();
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
+    for (auto disk = m_state->m_attachedDisks.begin(); disk != m_state->m_attachedDisks.end(); ++disk)
+    {
+        if (disk->second.IsPhysical != isPhysical || disk->second.Path != path)
+        {
+            continue;
+        }
+
+        if (isPhysical)
+        {
+            THROW_HR_WITH_USER_ERROR(WSL_E_DISK_ALREADY_ATTACHED, wsl::shared::Localization::MessageDiskAlreadyAttached(path.c_str()));
+        }
+
+        THROW_HR_IF(WSL_E_USER_VHD_ALREADY_ATTACHED, disk->second.IsUserDisk);
+        if (wsl::windows::common::disk::IsBackingVolumeMounted(disk->second.BackingFile.get()))
+        {
+            return disk->second.Attachment;
+        }
+
+        schema::RemoveScsiDisk(m_state->m_system.get(), disk->second.Attachment.GuestAddress.Lun);
+        if (disk->second.AccessGranted)
+        {
+            schema::RevokeVmAccess(m_state->m_machineId.c_str(), disk->second.Path.c_str());
+        }
+        m_state->m_attachedDisks.erase(disk);
+        break;
+    }
+
     const auto lunInUse = [&](std::uint32_t Lun) {
         for (const auto& entry : m_state->m_description.BootDisks)
         {
@@ -468,20 +503,79 @@ VmDiskAttachment HcsVirtualMachineBackend::AttachDisk(const VmDiskRequest& Reque
 
     THROW_HR_IF(E_BOUNDS, m_state->m_nextDiskId == UINT64_MAX);
     const VmDiskAttachment attachment{{m_state->m_description.Identity, m_state->m_nextDiskId}, {0, lun}, Request.ReadOnly};
-    const auto [disk, inserted] = m_state->m_attachedDisks.emplace(attachment.Id.Value, State::AttachedDisk{attachment});
+    State::AttachedDisk disk{attachment, path, isPhysical, Request.IsUserDisk, false, false, {}, Request.OperationTimeout};
+    auto cleanup = wil::scope_exit_log(WI_DIAGNOSTICS_INFO, [&] {
+        if (disk.AccessGranted)
+        {
+            schema::RevokeVmAccess(m_state->m_machineId.c_str(), disk.Path.c_str());
+        }
+        if (disk.WasOnline)
+        {
+            const auto diskHandle = wsl::windows::common::disk::OpenDevice(
+                disk.Path.c_str(), GENERIC_READ | GENERIC_WRITE, Request.OperationTimeout.count());
+            wsl::windows::common::disk::SetOnline(diskHandle.get(), true, Request.OperationTimeout.count());
+        }
+    });
+
+    try
+    {
+        if (isPhysical)
+        {
+            THROW_HR_IF(
+                WSL_E_ELEVATION_NEEDED_TO_MOUNT_DISK, Request.UserToken && !wsl::windows::common::security::IsTokenElevated(Request.UserToken.get()));
+            schema::GrantVmAccess(m_state->m_machineId.c_str(), path.c_str());
+            disk.AccessGranted = true;
+            {
+                const auto diskHandle = wsl::windows::common::disk::OpenDevice(
+                    path.c_str(), GENERIC_READ | GENERIC_WRITE, Request.OperationTimeout.count());
+                if (wsl::windows::common::disk::IsDiskOnline(diskHandle.get()))
+                {
+                    wsl::windows::common::disk::SetOnline(diskHandle.get(), false, Request.OperationTimeout.count());
+                    disk.WasOnline = true;
+                }
+            }
+            wsl::shared::retry::RetryWithTimeout<void>(
+                [&] { schema::AddPassThroughDisk(m_state->m_system.get(), path.c_str(), lun, Request.ReadOnly); },
+                wsl::windows::common::disk::c_diskOperationRetry,
+                Request.OperationTimeout,
+                [] { return wil::ResultFromCaughtException() == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION); });
+        }
+        else
+        {
+            disk.BackingFile = wsl::windows::common::disk::OpenVhdBackingFile(path.c_str());
+            const auto token = Request.UserToken ? Request.UserToken.get() : m_state->m_description.Identity.UserToken.get();
+            const auto grantAccess = [&] {
+                auto runAsUser = wil::impersonate_token(token);
+                schema::GrantVmAccess(m_state->m_machineId.c_str(), path.c_str());
+                disk.AccessGranted = true;
+            };
+            if (!Request.ReadOnly)
+            {
+                grantAccess();
+            }
+            auto result = wil::ResultFromException([&] { schema::AddVhd(m_state->m_system.get(), path.c_str(), lun, Request.ReadOnly); });
+            if (result == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED) && !disk.AccessGranted)
+            {
+                grantAccess();
+                schema::AddVhd(m_state->m_system.get(), path.c_str(), lun, Request.ReadOnly);
+            }
+            else
+            {
+                THROW_IF_FAILED(result);
+            }
+        }
+    }
+    catch (...)
+    {
+        const auto result = wil::ResultFromCaughtException();
+        THROW_HR_WITH_USER_ERROR(
+            result, wsl::shared::Localization::MessageFailedToAttachDisk(path.c_str(), wsl::windows::common::wslutil::GetSystemErrorString(result)));
+    }
+
+    const auto inserted = m_state->m_attachedDisks.emplace(attachment.Id.Value, std::move(disk)).second;
     WI_ASSERT(inserted);
-    auto rollback = wil::scope_exit([&] { m_state->m_attachedDisks.erase(disk); });
-    if (virtualDisk != nullptr)
-    {
-        schema::AddVhd(m_state->m_system.get(), virtualDisk->Path.c_str(), lun, Request.ReadOnly);
-    }
-    else
-    {
-        const auto& physicalDisk = std::get<VmPhysicalDiskSource>(Request.Source);
-        schema::AddPassThroughDisk(m_state->m_system.get(), physicalDisk.DevicePath.c_str(), lun, Request.ReadOnly);
-    }
     ++m_state->m_nextDiskId;
-    rollback.release();
+    cleanup.release();
     return attachment;
 }
 
@@ -492,7 +586,18 @@ void HcsVirtualMachineBackend::DetachDisk(VmDiskId Disk)
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
     const auto disk = m_state->m_attachedDisks.find(Disk.Value);
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), disk == m_state->m_attachedDisks.end());
-    schema::RemoveScsiDisk(m_state->m_system.get(), disk->second.Attachment.GuestAddress.Lun);
+    {
+        auto runAsSelf = wil::run_as_self();
+        schema::RemoveScsiDisk(m_state->m_system.get(), disk->second.Attachment.GuestAddress.Lun);
+        if (disk->second.AccessGranted)
+        {
+            schema::RevokeVmAccess(m_state->m_machineId.c_str(), disk->second.Path.c_str());
+        }
+    }
+    if (disk->second.WasOnline)
+    {
+        wsl::windows::common::disk::RestorePassthroughDiskState(disk->second.Path.c_str(), disk->second.OperationTimeout.count());
+    }
     m_state->m_attachedDisks.erase(disk);
 }
 

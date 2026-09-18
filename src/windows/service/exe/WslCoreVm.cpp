@@ -74,20 +74,6 @@ RequiredExtraMmioSpaceForPmemFileInMb(_In_ PCWSTR FilePath)
     return std::max(fileSizeBytes.QuadPart / static_cast<INT64>(_1MB), 1i64);
 }
 
-wil::unique_hfile OpenVhdBackingFile(_In_ PCWSTR Path)
-{
-    wil::unique_hfile file{CreateFileW(
-        Path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
-    THROW_LAST_ERROR_IF(!file);
-
-    return file;
-}
-
-bool IsBackingVolumeMounted(_In_ HANDLE File)
-{
-    DWORD bytesReturned{};
-    return DeviceIoControl(File, FSCTL_IS_VOLUME_MOUNTED, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
-}
 } // namespace
 
 WslCoreVm::WslCoreVm(_In_ wsl::core::Config&& VmConfig, _In_ InitializeDrvFsCallback InitializeDrvFs) :
@@ -829,7 +815,7 @@ WslCoreVm::~WslCoreVm() noexcept
     std::for_each(m_attachedDisks.begin(), m_attachedDisks.end(), [&](const auto& Entry) {
         if ((Entry.first.Type == DiskType::PassThrough) && (WI_IsFlagSet(Entry.second.Flags, DiskStateFlags::Online)))
         {
-            RestorePassthroughDiskState(Entry.first.Path.c_str());
+            wsl::windows::common::disk::RestorePassthroughDiskState(Entry.first.Path.c_str(), m_vmConfig.MountDeviceTimeout);
         }
 
         if (WI_IsFlagSet(Entry.second.Flags, DiskStateFlags::AccessGranted))
@@ -1074,7 +1060,7 @@ ULONG WslCoreVm::AttachDiskLockHeld(
                 THROW_HR_IF(WSL_E_USER_VHD_ALREADY_ATTACHED, found->first.User);
 
                 // Check if the lun is still valid. It could be stale if the backing volume is reattached.
-                if (IsBackingVolumeMounted(found->second.BackingFile.get()))
+                if (wsl::windows::common::disk::IsBackingVolumeMounted(found->second.BackingFile.get()))
                 {
                     return found->second.Lun;
                 }
@@ -1090,7 +1076,7 @@ ULONG WslCoreVm::AttachDiskLockHeld(
                 FreeLun(staleLun);
             }
 
-            backingFile = OpenVhdBackingFile(Disk);
+            backingFile = wsl::windows::common::disk::OpenVhdBackingFile(Disk);
 
             auto grantDiskAccess = [&]() {
                 auto runAsUser = wil::impersonate_token(UserToken);
@@ -1390,7 +1376,7 @@ std::pair<int, LX_MINI_MOUNT_STEP> WslCoreVm::DetachDisk(_In_opt_ PCWSTR Disk)
             // If the disk was online before being attached, revert to that state.
             if (WI_IsFlagSet(it->second.Flags, DiskStateFlags::Online))
             {
-                RestorePassthroughDiskState(it->first.Path.c_str());
+                wsl::windows::common::disk::RestorePassthroughDiskState(it->first.Path.c_str(), m_vmConfig.MountDeviceTimeout);
             }
 
             deleted = true;
@@ -1771,7 +1757,7 @@ std::wstring WslCoreVm::GenerateConfigJson()
     // inherited ACLs; otherwise StartComputeSystem will surface E_ACCESSDENIED.
     auto attachDisk = [&](PCWSTR path, bool grantVmAccess) {
         auto lun = ReserveLun();
-        auto backingFile = OpenVhdBackingFile(path);
+        auto backingFile = wsl::windows::common::disk::OpenVhdBackingFile(path);
         scsiController.Attachments[std::to_string(lun)] = hcs::CreateVhdAttachment(path, true);
 
         DiskStateFlags diskFlags{};
@@ -2413,15 +2399,6 @@ ULONG WslCoreVm::ReserveLun(_In_ std::optional<ULONG> Lun)
 
     THROW_HR(WSL_E_TOO_MANY_DISKS_ATTACHED);
 }
-
-void WslCoreVm::RestorePassthroughDiskState(_In_ LPCWSTR Disk) const
-try
-{
-    const auto diskHandle = wsl::windows::common::disk::OpenDevice(Disk, GENERIC_READ | GENERIC_WRITE, m_vmConfig.MountDeviceTimeout);
-    wsl::windows::common::disk::SetOnline(diskHandle.get(), true, m_vmConfig.MountDeviceTimeout);
-    return;
-}
-CATCH_LOG()
 
 void WslCoreVm::RegisterCallbacks(_In_ const std::function<void(ULONG)>& DistroExitCallback, _In_ const std::function<void(GUID)>& TerminationCallback)
 {

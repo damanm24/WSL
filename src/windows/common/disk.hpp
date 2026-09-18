@@ -18,11 +18,17 @@ namespace wsl::windows::common::disk {
 
 constexpr inline auto c_diskOperationRetry = std::chrono::milliseconds(500);
 
+wil::unique_hfile OpenVhdBackingFile(_In_ PCWSTR Path);
+
+bool IsBackingVolumeMounted(_In_ HANDLE File);
+
 wil::unique_hfile OpenDevice(_In_ LPCWSTR Name, _In_ DWORD Access = GENERIC_READ, _In_ size_t TimeoutMs = 5 * 1000);
 
 bool IsDiskOnline(_In_ HANDLE Disk);
 
 void SetOnline(_In_ HANDLE Disk, _In_ bool Online, _In_ size_t TimeoutMs = 5 * 1000);
+
+void RestorePassthroughDiskState(_In_ LPCWSTR Disk, _In_ size_t TimeoutMs) noexcept;
 
 void LockVolume(_In_ HANDLE Disk);
 

@@ -304,6 +304,11 @@ struct VmDiskRequest
     std::variant<VmVirtualDiskSource, VmPhysicalDiskSource> Source;
     bool ReadOnly = true;
     std::optional<VmScsiPlacement> Placement;
+    // Identifies caller-owned VHDs, which cannot be reused by a later attach request.
+    bool IsUserDisk = false;
+    // Used to validate elevated pass-through-disk requests and impersonate VM-access grants.
+    wil::shared_handle UserToken;
+    std::chrono::milliseconds OperationTimeout{5 * 1000};
 };
 
 struct VmBootDiskRequest

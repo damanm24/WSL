@@ -18,6 +18,20 @@ Abstract:
 #include "disk.hpp"
 #include "wslutil.h"
 
+wil::unique_hfile wsl::windows::common::disk::OpenVhdBackingFile(_In_ PCWSTR Path)
+{
+    wil::unique_hfile file{CreateFileW(
+        Path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+    THROW_LAST_ERROR_IF(!file);
+    return file;
+}
+
+bool wsl::windows::common::disk::IsBackingVolumeMounted(_In_ HANDLE File)
+{
+    DWORD bytesReturned{};
+    return DeviceIoControl(File, FSCTL_IS_VOLUME_MOUNTED, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
+}
+
 wil::unique_hfile wsl::windows::common::disk::OpenDevice(_In_ LPCWSTR Name, _In_ DWORD Access, size_t TimeoutMs)
 {
     auto openDevice = [&]() {
@@ -104,6 +118,14 @@ void wsl::windows::common::disk::SetOnline(_In_ HANDLE Disk, _In_ bool Online, _
     attributes.Attributes = Online ? 0 : DISK_ATTRIBUTE_OFFLINE;
     Ioctl(Disk, IOCTL_DISK_SET_DISK_ATTRIBUTES, &attributes, sizeof(attributes));
 }
+
+void wsl::windows::common::disk::RestorePassthroughDiskState(_In_ LPCWSTR Disk, _In_ size_t TimeoutMs) noexcept
+try
+{
+    const auto diskHandle = OpenDevice(Disk, GENERIC_READ | GENERIC_WRITE, TimeoutMs);
+    SetOnline(diskHandle.get(), true, TimeoutMs);
+}
+CATCH_LOG()
 
 DWORD
 wsl::windows::common::disk::GetDiskNumber(_In_ HANDLE Disk)

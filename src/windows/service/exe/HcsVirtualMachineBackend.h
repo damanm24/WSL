@@ -61,11 +61,19 @@ private:
         struct AttachedDisk
         {
             VmDiskAttachment Attachment;
+            std::wstring Path;
+            bool IsPhysical = false;
+            bool IsUserDisk = false;
+            bool AccessGranted = false;
+            bool WasOnline = false;
+            wil::unique_hfile BackingFile;
+            std::chrono::milliseconds OperationTimeout;
         };
 
         wil::srwlock m_lock;
         VmDescription m_description;
         std::wstring m_configuration;
+        std::wstring m_machineId;
         wil::unique_event m_terminatingEvent{wil::EventOptions::ManualReset};
         _Guarded_by_(m_lock) std::map<std::uint64_t, AttachedDisk> m_attachedDisks;
         _Guarded_by_(m_lock) std::uint64_t m_nextDiskId = 1;

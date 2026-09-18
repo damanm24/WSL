@@ -14,6 +14,7 @@ namespace helpers = wsl::windows::common::helpers;
 
 constexpr UINT64 c_mib = 1024 * 1024;
 constexpr UINT64 c_memoryGranularity = 2 * c_mib;
+constexpr UINT32 c_maximumDisks = 254;
 constexpr HRESULT c_notSupported = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 
 bool ResolveFeature(VmFeatureRequest Request, bool Supported)
@@ -241,6 +242,60 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
                          std::to_string(virtio.Port), schema::VirtioSerialPort{virtio.GuestName, virtio.NamedPipe.native(), virtio.ConsoleSupport})
                      .second);
         }
+    }
+
+    THROW_HR_IF(c_notSupported, Request.BootDisks.size() > c_maximumDisks);
+    std::bitset<c_maximumDisks> allocated;
+    // Reserve explicit addresses before assigning any automatic placements.
+    for (const auto& disk : Request.BootDisks)
+    {
+        THROW_HR_IF(E_INVALIDARG, disk.Key.empty() || disk.Key.find(L'\0') != std::wstring::npos);
+        THROW_HR_IF(E_INVALIDARG, !description.BootDisks.emplace(disk.Key, VmDiskAttachment{}).second);
+        if (disk.Disk.Placement)
+        {
+            const auto& address = disk.Disk.Placement->Address;
+            THROW_HR_IF(c_notSupported, address.Controller != 0 || address.Lun >= c_maximumDisks);
+            THROW_HR_IF(E_INVALIDARG, allocated.test(address.Lun));
+            allocated.set(address.Lun);
+        }
+    }
+
+    auto& scsi = vm.Devices.Scsi["0"];
+    UINT64 nextId = 1;
+    for (const auto& disk : Request.BootDisks)
+    {
+        UINT32 lun = 0;
+        if (disk.Disk.Placement)
+        {
+            lun = disk.Disk.Placement->Address.Lun;
+        }
+        else
+        {
+            while (lun < c_maximumDisks && allocated.test(lun))
+            {
+                ++lun;
+            }
+            THROW_HR_IF(E_BOUNDS, lun == c_maximumDisks);
+            allocated.set(lun);
+        }
+
+        schema::Attachment attachment{};
+        attachment.ReadOnly = disk.Disk.ReadOnly;
+        if (const auto* source = std::get_if<VmVirtualDiskSource>(&disk.Disk.Source))
+        {
+            validation::ValidatePath(source->Path, L"HCS");
+            THROW_HR_IF(E_INVALIDARG, source->Format != VmDiskFormat::Vhd && source->Format != VmDiskFormat::Vhdx);
+            attachment = schema::CreateVhdAttachment(source->Path.c_str(), disk.Disk.ReadOnly);
+        }
+        else
+        {
+            const auto& physical = std::get<VmPhysicalDiskSource>(disk.Disk.Source);
+            validation::ValidatePath(physical.DevicePath, L"HCS");
+            attachment.Type = schema::AttachmentType::PassThru;
+            attachment.Path = physical.DevicePath;
+        }
+        scsi.Attachments.emplace(std::to_string(lun), std::move(attachment));
+        description.BootDisks.at(disk.Key) = {{description.Identity, nextId++}, {0, lun}, disk.Disk.ReadOnly};
     }
 
     if (Request.CrashCapture)

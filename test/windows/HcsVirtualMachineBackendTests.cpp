@@ -46,6 +46,14 @@ HRESULT ConfigurationResult(const VmCreateRequest& Request)
     return wil::ResultFromException([&] { BuildConfiguration(Request); });
 }
 
+VmBootDiskRequest CreateDisk(std::wstring Key)
+{
+    VmBootDiskRequest disk;
+    disk.Key = std::move(Key);
+    disk.Disk.Source = VmVirtualDiskSource{L"C:\\images\\disk.vhdx"};
+    return disk;
+}
+
 } // namespace
 
 namespace HcsVirtualMachineBackendTests {
@@ -120,6 +128,7 @@ class HcsVirtualMachineBackendTests
         VERIFY_ARE_EQUAL(request.Memory.SizeBytes / c_mib, vm.ComputeTopology.Memory.SizeInMB);
         VERIFY_ARE_EQUAL(request.Boot.KernelCommandLine, description.Boot.KernelCommandLine);
         VERIFY_IS_TRUE(description.BootDisks.empty());
+        VERIFY_IS_TRUE(vm.Devices.Scsi.at("0").Attachments.empty());
         VERIFY_IS_TRUE(vm.Devices.ComPorts.empty());
         VERIFY_IS_FALSE(vm.Devices.VirtioSerial.has_value());
         VERIFY_IS_FALSE(vm.DebugOptions.BugcheckSavedStateFileName.has_value());
@@ -459,6 +468,48 @@ class HcsVirtualMachineBackendTests
         request.Processor.PerfmonPmu = VmFeatureRequest::Preferred;
         request.Processor.PerfmonLbr = VmFeatureRequest::Required;
         VERIFY_ARE_EQUAL(lbr ? S_OK : c_notSupported, ConfigurationResult(request));
+    }
+
+    TEST_METHOD(ReservesExplicitDiskPlacementsFirst)
+    {
+        auto request = CreateRequest();
+        request.BootDisks = {CreateDisk(L"automatic"), CreateDisk(L"explicit")};
+        request.BootDisks[0].Disk.ReadOnly = false;
+        request.BootDisks[1].Disk.Placement = VmScsiPlacement{{0, 0}};
+        const auto configuration = BuildConfiguration(request);
+        const auto& disks = configuration.Settings.VirtualMachine.Devices.Scsi.at("0").Attachments;
+        VERIFY_ARE_EQUAL(UINT32{1}, configuration.Description.BootDisks.at(L"automatic").GuestAddress.Lun);
+        VERIFY_ARE_EQUAL(UINT32{0}, configuration.Description.BootDisks.at(L"explicit").GuestAddress.Lun);
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, configuration.Description.BootDisks.at(L"automatic").Id.Owner.VmId));
+        VERIFY_IS_FALSE(disks.at("1").ReadOnly);
+        VERIFY_IS_TRUE(disks.at("0").ReadOnly);
+        VERIFY_ARE_EQUAL(schema::AttachmentType::VirtualDisk, disks.at("0").Type);
+        for (const auto& [lun, disk] : disks)
+        {
+            const nlohmann::json expected = {
+                {"Type", "VirtualDisk"},
+                {"Path", "C:\\images\\disk.vhdx"},
+                {"ReadOnly", lun == "0"},
+                {"SupportCompressedVolumes", true},
+                {"AlwaysAllowSparseFiles", true},
+                {"SupportEncryptedFiles", true}};
+            VERIFY_IS_TRUE(expected == nlohmann::json(disk));
+        }
+        request.BootDisks[0].Disk.Placement = VmScsiPlacement{{0, 0}};
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.BootDisks[0].Disk.Placement.reset();
+        request.BootDisks[0].Key = request.BootDisks[1].Key;
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.BootDisks[0].Key = L"physical";
+        request.BootDisks[0].Disk.Source = VmPhysicalDiskSource{L"\\\\.\\PhysicalDrive1"};
+        const auto physical = BuildConfiguration(request).Settings.VirtualMachine.Devices.Scsi.at("0").Attachments.at("1");
+        VERIFY_ARE_EQUAL(schema::AttachmentType::PassThru, physical.Type);
+        VERIFY_ARE_EQUAL(std::wstring{L"\\\\.\\PhysicalDrive1"}, physical.Path);
+        VERIFY_IS_FALSE(physical.SupportCompressedVolumes);
+        VERIFY_IS_FALSE(physical.AlwaysAllowSparseFiles);
+        VERIFY_IS_FALSE(physical.SupportEncryptedFiles);
+        request.BootDisks[0].Disk.Placement = VmScsiPlacement{{0, 254}};
+        VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), ConfigurationResult(request));
     }
 
     TEST_METHOD(UsesOnlyCallerProvidedCrashDestination)

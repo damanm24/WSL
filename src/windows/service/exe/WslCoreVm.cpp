@@ -1047,7 +1047,7 @@ ULONG WslCoreVm::AttachDiskLockHeld(
 
             // Add the disk to the VM.
             wsl::shared::retry::RetryWithTimeout<void>(
-                std::bind(wsl::windows::common::hcs::AddPassThroughDisk, m_system.get(), Disk, Lun.value()),
+                [&] { wsl::windows::common::hcs::AddPassThroughDisk(m_system.get(), Disk, Lun.value()); },
                 wsl::windows::common::disk::c_diskOperationRetry,
                 std::chrono::milliseconds(m_vmConfig.MountDeviceTimeout),
                 []() { return wil::ResultFromCaughtException() == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION); });

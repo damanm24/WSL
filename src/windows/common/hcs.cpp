@@ -118,9 +118,15 @@ void wsl::windows::common::hcs::AddVhd(_In_ HCS_SYSTEM ComputeSystem, _In_ PCWST
 
 void wsl::windows::common::hcs::AddPassThroughDisk(_In_ HCS_SYSTEM ComputeSystem, _In_ PCWSTR Disk, _In_ ULONG Lun)
 {
+    AddPassThroughDisk(ComputeSystem, Disk, Lun, false);
+}
+
+void wsl::windows::common::hcs::AddPassThroughDisk(_In_ HCS_SYSTEM ComputeSystem, _In_ PCWSTR Disk, _In_ ULONG Lun, _In_ bool ReadOnly)
+{
     ModifySettingRequest<Attachment> request{};
     request.RequestType = ModifyRequestType::Add;
     request.Settings.Path = Disk;
+    request.Settings.ReadOnly = ReadOnly;
     request.ResourcePath = c_scsiResourcePath + std::to_wstring(Lun);
     request.Settings.Type = AttachmentType::PassThru;
 

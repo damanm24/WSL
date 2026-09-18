@@ -9,10 +9,34 @@ namespace validation = wsl::windows::common::vm::validation;
 namespace {
 
 namespace schema = wsl::windows::common::hcs;
+namespace helpers = wsl::windows::common::helpers;
 
 constexpr UINT64 c_mib = 1024 * 1024;
 constexpr UINT64 c_memoryGranularity = 2 * c_mib;
 constexpr HRESULT c_notSupported = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+
+bool ResolveFeature(VmFeatureRequest Request, bool Supported)
+{
+    switch (Request)
+    {
+    case VmFeatureRequest::Disabled:
+        return false;
+    case VmFeatureRequest::Preferred:
+        return Supported;
+    case VmFeatureRequest::Required:
+        THROW_HR_IF(c_notSupported, !Supported);
+        return true;
+    }
+
+    THROW_HR(E_INVALIDARG);
+}
+
+bool ResolveSelection(VmSelectionPolicy Policy, bool Supported)
+{
+    THROW_HR_IF(E_INVALIDARG, Policy != VmSelectionPolicy::Required && Policy != VmSelectionPolicy::Preferred);
+    THROW_HR_IF(c_notSupported, Policy == VmSelectionPolicy::Required && !Supported);
+    return Supported;
+}
 
 std::wstring GetVmbFsPath(const std::filesystem::path& Path, const std::filesystem::path& Root)
 {
@@ -102,8 +126,70 @@ wsl::windows::common::vm::hcs::VmConfiguration wsl::windows::common::vm::hcs::Bu
         THROW_HR(E_INVALIDARG);
     }
 
-    vm.ComputeTopology.Processor.Count = description.Processor.Count;
-    vm.ComputeTopology.Memory.SizeInMB = description.Memory.SizeBytes / c_mib;
+    bool nestedVirtualization = false;
+    if (Request.Processor.NestedVirtualization != VmFeatureRequest::Disabled)
+    {
+        nestedVirtualization = schema::IsNestedVirtualizationSupported();
+    }
+    description.Processor.NestedVirtualization = ResolveFeature(Request.Processor.NestedVirtualization, nestedVirtualization);
+
+    const auto perfmon = schema::GetPerfmonCapabilities();
+    description.Processor.PerfmonPmu = ResolveFeature(Request.Processor.PerfmonPmu, perfmon.Pmu);
+    description.Processor.PerfmonLbr = ResolveFeature(Request.Processor.PerfmonLbr, perfmon.Lbr);
+    auto& processor = vm.ComputeTopology.Processor;
+    processor.Count = description.Processor.Count;
+    if (Request.Processor.NestedVirtualization != VmFeatureRequest::Disabled)
+    {
+        processor.ExposeVirtualizationExtensions = description.Processor.NestedVirtualization;
+    }
+    if (Request.Processor.PerfmonPmu != VmFeatureRequest::Disabled)
+    {
+        processor.EnablePerfmonPmu = description.Processor.PerfmonPmu;
+    }
+    if (Request.Processor.PerfmonLbr != VmFeatureRequest::Disabled)
+    {
+        processor.EnablePerfmonLbr = description.Processor.PerfmonLbr;
+    }
+
+    description.Memory.AllowOvercommit = ResolveFeature(Request.Memory.AllowOvercommit, true);
+    description.Memory.DeferredCommit = ResolveFeature(Request.Memory.DeferredCommit, true);
+    description.Memory.ColdDiscard = ResolveFeature(Request.Memory.ColdDiscard, true);
+    THROW_HR_IF(E_INVALIDARG, description.Memory.DeferredCommit && !description.Memory.AllowOvercommit);
+    auto& memory = vm.ComputeTopology.Memory;
+    memory.SizeInMB = description.Memory.SizeBytes / c_mib;
+    memory.AllowOvercommit = description.Memory.AllowOvercommit;
+    memory.EnableDeferredCommit = description.Memory.DeferredCommit;
+    memory.EnableColdDiscardHint = description.Memory.ColdDiscard;
+
+    if (Request.Memory.SmallPages)
+    {
+        const auto& smallPages = *Request.Memory.SmallPages;
+        if (ResolveSelection(smallPages.Policy, helpers::IsSmallPageMemorySupported(helpers::GetWindowsVersion())))
+        {
+            schema::ConfigureSmallPageMemory(memory, smallPages.FaultClusterSizeShift, smallPages.DirectMapFaultClusterSizeShift);
+            description.Memory.SmallPages = true;
+            description.Memory.FaultClusterSizeShift = memory.FaultClusterSizeShift;
+            description.Memory.DirectMapFaultClusterSizeShift = memory.DirectMapFaultClusterSizeShift;
+        }
+    }
+
+    if (Request.Memory.Mmio)
+    {
+        const auto& mmio = *Request.Memory.Mmio;
+        THROW_HR_IF(E_INVALIDARG, mmio.HighWindowSizeBytes == 0 || mmio.HighWindowSizeBytes % c_mib != 0);
+        memory.HighMmioGapInMB = mmio.HighWindowSizeBytes / c_mib;
+        description.Memory.HighMmioSizeBytes = mmio.HighWindowSizeBytes;
+        if (mmio.MaximumGuestAddressBits)
+        {
+            const auto bits = *mmio.MaximumGuestAddressBits;
+            THROW_HR_IF(E_INVALIDARG, bits <= 32 || bits >= 64);
+            const UINT64 addressLimit = UINT64{1} << bits;
+            THROW_HR_IF(E_INVALIDARG, mmio.HighWindowSizeBytes > addressLimit - (UINT64{1} << 32));
+            const auto base = addressLimit - mmio.HighWindowSizeBytes;
+            memory.HighMmioBaseInMB = base / c_mib;
+            description.Memory.HighMmioBaseBytes = base;
+        }
+    }
 
     const auto tokenUser = wil::get_token_information<TOKEN_USER>(Request.Identity.UserToken.get());
     vm.Devices.HvSocket = schema::CreateHvSocketConfiguration(tokenUser->User.Sid);

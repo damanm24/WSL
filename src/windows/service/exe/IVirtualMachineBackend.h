@@ -196,8 +196,17 @@ struct VmProcessorRequest
 
 struct VmMmioRequest
 {
+    // A nonzero, MiB-aligned window. Without an address limit, the host chooses its base.
     std::uint64_t HighWindowSizeBytes = 0;
     std::optional<std::uint8_t> MaximumGuestAddressBits;
+};
+
+struct VmSmallPageMemoryRequest
+{
+    // Shifts are relative to 4-KiB pages. The caller must coordinate guest page-reporting settings.
+    std::uint32_t FaultClusterSizeShift = 4;
+    std::uint32_t DirectMapFaultClusterSizeShift = 4;
+    VmSelectionPolicy Policy = VmSelectionPolicy::Required;
 };
 
 struct VmMemoryRequest
@@ -206,6 +215,8 @@ struct VmMemoryRequest
     VmFeatureRequest AllowOvercommit = VmFeatureRequest::Disabled;
     VmFeatureRequest DeferredCommit = VmFeatureRequest::Disabled;
     VmFeatureRequest ColdDiscard = VmFeatureRequest::Disabled;
+    std::optional<VmSmallPageMemoryRequest> SmallPages;
+    std::optional<VmMmioRequest> Mmio;
 };
 
 enum class VmBootMethod
@@ -341,6 +352,9 @@ struct VmEffectiveMemory
     bool AllowOvercommit = false;
     bool DeferredCommit = false;
     bool ColdDiscard = false;
+    bool SmallPages = false;
+    std::optional<std::uint32_t> FaultClusterSizeShift;
+    std::optional<std::uint32_t> DirectMapFaultClusterSizeShift;
     std::optional<std::uint64_t> HighMmioBaseBytes;
     std::optional<std::uint64_t> HighMmioSizeBytes;
 };

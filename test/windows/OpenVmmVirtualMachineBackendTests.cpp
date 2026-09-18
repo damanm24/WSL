@@ -141,6 +141,16 @@ class OpenVmmVirtualMachineBackendTests
     {
         SKIP_TEST_ARM64();
         auto request = CreateRequest();
+        request.Memory.Mmio = VmMmioRequest{16 * 1024 * c_mib, 36};
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+        request.Memory.Mmio.reset();
+        request.Memory.SmallPages = VmSmallPageMemoryRequest{};
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+        request.Memory.SmallPages->Policy = VmSelectionPolicy::Preferred;
+        VERIFY_IS_FALSE(ValidateCreateRequest(request).Memory.SmallPages);
+        request.Memory.SmallPages->Policy = static_cast<VmSelectionPolicy>(100);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
+        request.Memory.SmallPages.reset();
         request.Boot.UefiRootPath = L"C:\\images";
         VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
     }

@@ -12,6 +12,8 @@ using helpers::WindowsBuildNumbers;
 namespace {
 
 constexpr UINT64 c_mib = 1024 * 1024;
+constexpr UINT64 c_gib = 1024 * c_mib;
+constexpr HRESULT c_notSupported = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 
 VmCreateRequest CreateRequest()
 {
@@ -205,6 +207,91 @@ class HcsVirtualMachineBackendTests
         }
     }
 
+    TEST_METHOD(UsesCallerMmioWindowAndAddressLimit)
+    {
+        auto request = CreateRequest();
+        const auto defaults = BuildConfiguration(request);
+        VERIFY_IS_FALSE(defaults.Settings.VirtualMachine.ComputeTopology.Memory.HighMmioGapInMB.has_value());
+        VERIFY_IS_FALSE(defaults.Settings.VirtualMachine.ComputeTopology.Memory.HighMmioBaseInMB.has_value());
+        request.Memory.Mmio = VmMmioRequest{24 * c_gib, 36};
+        const auto configuration = BuildConfiguration(request);
+        const auto& memory = configuration.Settings.VirtualMachine.ComputeTopology.Memory;
+        VERIFY_ARE_EQUAL(UINT64{24 * 1024}, memory.HighMmioGapInMB.value());
+        VERIFY_ARE_EQUAL(UINT64{40 * 1024}, memory.HighMmioBaseInMB.value());
+        VERIFY_ARE_EQUAL(24 * c_gib, configuration.Description.Memory.HighMmioSizeBytes.value());
+        VERIFY_ARE_EQUAL(40 * c_gib, configuration.Description.Memory.HighMmioBaseBytes.value());
+        const nlohmann::json json = memory;
+        VERIFY_ARE_EQUAL(UINT64{24 * 1024}, json.at("HighMmioGapInMB").get<UINT64>());
+        VERIFY_ARE_EQUAL(UINT64{40 * 1024}, json.at("HighMmioBaseInMB").get<UINT64>());
+        request.Memory.Mmio->MaximumGuestAddressBits.reset();
+        const auto hostBase = BuildConfiguration(request);
+        VERIFY_IS_TRUE(hostBase.Settings.VirtualMachine.ComputeTopology.Memory.HighMmioGapInMB.has_value());
+        VERIFY_IS_FALSE(hostBase.Settings.VirtualMachine.ComputeTopology.Memory.HighMmioBaseInMB.has_value());
+        VERIFY_IS_FALSE(hostBase.Description.Memory.HighMmioBaseBytes.has_value());
+    }
+
+    TEST_METHOD(RejectsInvalidMmioWindows)
+    {
+        auto request = CreateRequest();
+        request.Memory.Mmio = VmMmioRequest{0, 36};
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.Memory.Mmio->HighWindowSizeBytes = 16 * c_gib + 1;
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.Memory.Mmio->HighWindowSizeBytes = 16 * c_gib;
+        request.Memory.Mmio->MaximumGuestAddressBits = 64;
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.Memory.Mmio->MaximumGuestAddressBits = 32;
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.Memory.Mmio->MaximumGuestAddressBits = 36;
+        request.Memory.Mmio->HighWindowSizeBytes = 60 * c_gib;
+        VERIFY_SUCCEEDED(ConfigurationResult(request));
+        request.Memory.Mmio->HighWindowSizeBytes += c_mib;
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.Memory.Mmio->HighWindowSizeBytes = 64 * c_gib;
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+    }
+
+    TEST_METHOD(GatesSmallPagesAndFaultClustersTogether)
+    {
+        auto request = CreateRequest();
+        request.Memory.SmallPages = VmSmallPageMemoryRequest{4, 3, VmSelectionPolicy::Preferred};
+        const auto configuration = BuildConfiguration(request);
+        const auto& memory = configuration.Settings.VirtualMachine.ComputeTopology.Memory;
+        const bool supported = helpers::IsSmallPageMemorySupported(helpers::GetWindowsVersion());
+        VERIFY_ARE_EQUAL(supported, configuration.Description.Memory.SmallPages);
+        VERIFY_ARE_EQUAL(supported, memory.BackingPageSize.has_value());
+        VERIFY_ARE_EQUAL(supported, memory.FaultClusterSizeShift.has_value());
+        VERIFY_ARE_EQUAL(supported, memory.DirectMapFaultClusterSizeShift.has_value());
+        VERIFY_ARE_EQUAL(supported, configuration.Description.Memory.FaultClusterSizeShift.has_value());
+        VERIFY_ARE_EQUAL(supported, configuration.Description.Memory.DirectMapFaultClusterSizeShift.has_value());
+        if (supported)
+        {
+            VERIFY_ARE_EQUAL(schema::MemoryBackingPageSize::Small, memory.BackingPageSize.value());
+            VERIFY_ARE_EQUAL(UINT32{4}, memory.FaultClusterSizeShift.value());
+            VERIFY_ARE_EQUAL(UINT32{3}, memory.DirectMapFaultClusterSizeShift.value());
+            VERIFY_ARE_EQUAL(UINT32{4}, configuration.Description.Memory.FaultClusterSizeShift.value());
+            VERIFY_ARE_EQUAL(UINT32{3}, configuration.Description.Memory.DirectMapFaultClusterSizeShift.value());
+        }
+        request.Memory.SmallPages->Policy = VmSelectionPolicy::Required;
+        VERIFY_ARE_EQUAL(supported ? S_OK : c_notSupported, ConfigurationResult(request));
+        request.Memory.SmallPages->Policy = static_cast<VmSelectionPolicy>(100);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+    }
+
+    TEST_METHOD(PreservesSmallPageWindowsCompatibilityGate)
+    {
+        const auto supported = [](ULONG Build, DWORD Revision) {
+            return helpers::IsSmallPageMemorySupported({10, 0, Build, Revision});
+        };
+        VERIFY_IS_FALSE(supported(WindowsBuildNumbers::Vibranium_22H2, 3392));
+        VERIFY_IS_TRUE(supported(WindowsBuildNumbers::Vibranium_22H2, 3393));
+        VERIFY_IS_FALSE(supported(WindowsBuildNumbers::Iron, 1969));
+        VERIFY_IS_TRUE(supported(WindowsBuildNumbers::Iron, 1970));
+        VERIFY_IS_FALSE(supported(WindowsBuildNumbers::Cobalt, 0));
+        VERIFY_IS_TRUE(supported(WindowsBuildNumbers::Cobalt, 2360));
+        VERIFY_IS_TRUE(supported(WindowsBuildNumbers::Germanium, 0));
+    }
+
     TEST_METHOD(RejectsInvalidInputsBeforeCreatingSystem)
     {
         auto request = CreateRequest();
@@ -231,6 +318,65 @@ class HcsVirtualMachineBackendTests
         VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
     }
 
+    TEST_METHOD(AppliesOnlyRequestedMemoryFeatures)
+    {
+        auto request = CreateRequest();
+        const auto disabled = BuildConfiguration(request).Settings.VirtualMachine.ComputeTopology.Memory;
+        VERIFY_IS_FALSE(disabled.AllowOvercommit);
+        VERIFY_IS_FALSE(disabled.EnableDeferredCommit);
+        VERIFY_IS_FALSE(disabled.EnableColdDiscardHint);
+        VERIFY_IS_FALSE(disabled.BackingPageSize.has_value());
+        request.Memory.DeferredCommit = VmFeatureRequest::Required;
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+        request.Memory.AllowOvercommit = VmFeatureRequest::Required;
+        request.Memory.ColdDiscard = VmFeatureRequest::Preferred;
+        const auto enabled = BuildConfiguration(request).Settings.VirtualMachine.ComputeTopology.Memory;
+        VERIFY_IS_TRUE(enabled.AllowOvercommit);
+        VERIFY_IS_TRUE(enabled.EnableDeferredCommit);
+        VERIFY_IS_TRUE(enabled.EnableColdDiscardHint);
+        request.Memory.ColdDiscard = static_cast<VmFeatureRequest>(100);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, ConfigurationResult(request));
+    }
+
+    TEST_METHOD(ResolvesRequestedProcessorFeatures)
+    {
+        auto request = CreateRequest();
+        request.Processor.NestedVirtualization = VmFeatureRequest::Preferred;
+        request.Processor.PerfmonPmu = VmFeatureRequest::Preferred;
+        request.Processor.PerfmonLbr = VmFeatureRequest::Preferred;
+
+        bool nested = false;
+        if (helpers::IsWindows11OrAbove())
+        {
+            const auto& features = schema::GetProcessorFeatures();
+            nested = std::find(features.begin(), features.end(), "NestedVirt") != features.end();
+        }
+        bool pmu = false;
+        bool lbr = false;
+#ifdef _AMD64_
+        HV_X64_HYPERVISOR_HARDWARE_FEATURES hardwareFeatures{};
+        __cpuid(reinterpret_cast<int*>(&hardwareFeatures), HvCpuIdFunctionMsHvHardwareFeatures);
+        pmu = hardwareFeatures.ChildPerfmonPmuSupported != 0;
+        lbr = hardwareFeatures.ChildPerfmonLbrSupported != 0;
+#endif
+        const auto configuration = BuildConfiguration(request);
+        const auto& processor = configuration.Settings.VirtualMachine.ComputeTopology.Processor;
+        VERIFY_ARE_EQUAL(nested, processor.ExposeVirtualizationExtensions.value());
+        VERIFY_ARE_EQUAL(pmu, processor.EnablePerfmonPmu.value());
+        VERIFY_ARE_EQUAL(lbr, processor.EnablePerfmonLbr.value());
+        VERIFY_ARE_EQUAL(nested, configuration.Description.Processor.NestedVirtualization);
+        VERIFY_ARE_EQUAL(pmu, configuration.Description.Processor.PerfmonPmu);
+        VERIFY_ARE_EQUAL(lbr, configuration.Description.Processor.PerfmonLbr);
+
+        request.Processor.NestedVirtualization = VmFeatureRequest::Required;
+        VERIFY_ARE_EQUAL(nested ? S_OK : c_notSupported, ConfigurationResult(request));
+        request.Processor.NestedVirtualization = VmFeatureRequest::Preferred;
+        request.Processor.PerfmonPmu = VmFeatureRequest::Required;
+        VERIFY_ARE_EQUAL(pmu ? S_OK : c_notSupported, ConfigurationResult(request));
+        request.Processor.PerfmonPmu = VmFeatureRequest::Preferred;
+        request.Processor.PerfmonLbr = VmFeatureRequest::Required;
+        VERIFY_ARE_EQUAL(lbr ? S_OK : c_notSupported, ConfigurationResult(request));
+    }
 };
 
 } // namespace HcsVirtualMachineBackendTests

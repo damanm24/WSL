@@ -128,6 +128,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
             Request.Boot.Method != VmBootMethod::Uefi);
     THROW_HR_IF(c_notSupported, Request.Boot.Method == VmBootMethod::Uefi);
     THROW_HR_IF(c_notSupported, Request.Boot.UefiRootPath.has_value());
+    THROW_HR_IF(c_notSupported, Request.Memory.Mmio.has_value());
 
     VmDescription description;
     description.Identity = Request.Identity;
@@ -147,6 +148,10 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
     validation::ValidateFeature(Request.Memory.DeferredCommit, L"deferred memory commit");
     validation::ValidateFeature(Request.Memory.ColdDiscard, L"cold discard");
 
+    if (Request.Memory.SmallPages)
+    {
+        validation::ValidateUnsupportedSelection(Request.Memory.SmallPages->Policy);
+    }
     if (Request.CrashCapture)
     {
         validation::ValidateUnsupportedSelection(Request.CrashCapture->Policy);

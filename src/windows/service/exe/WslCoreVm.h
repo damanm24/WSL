@@ -245,8 +245,6 @@ private:
     _Requires_lock_held_(m_lock)
     ULONG ReserveLun(_In_ std::optional<ULONG> Lun = {});
 
-    void RestorePassthroughDiskState(_In_ LPCWSTR Disk) const;
-
     _Requires_lock_held_(m_lock)
     static void SaveDiskState(_In_ HKEY Key, _In_ const AttachedDisk& Disk, _In_ const DiskState& State, _In_ const DiskType& DiskType);
 

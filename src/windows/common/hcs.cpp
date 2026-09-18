@@ -26,6 +26,59 @@ constexpr auto c_processorCapabilities = "ProcessorCapabilities";
 constexpr LPCWSTR c_processorCapabilitiesQuery = L"{ \"PropertyQueries\": {\"ProcessorCapabilities\" : {}}}";
 constexpr LPCWSTR c_scsiResourcePath = L"VirtualMachine/Devices/Scsi/0/Attachments/";
 
+bool wsl::windows::common::hcs::IsNestedVirtualizationSupported()
+{
+    if (!helpers::IsWindows11OrAbove())
+    {
+        return false;
+    }
+
+    const auto& features = GetProcessorFeatures();
+    return std::find(features.begin(), features.end(), "NestedVirt") != features.end();
+}
+
+wsl::windows::common::hcs::PerfmonCapabilities wsl::windows::common::hcs::GetPerfmonCapabilities()
+{
+    PerfmonCapabilities capabilities{};
+#ifdef _AMD64_
+    HV_X64_HYPERVISOR_HARDWARE_FEATURES hardwareFeatures{};
+    __cpuid(reinterpret_cast<int*>(&hardwareFeatures), HvCpuIdFunctionMsHvHardwareFeatures);
+    capabilities.Pmu = hardwareFeatures.ChildPerfmonPmuSupported != 0;
+    capabilities.Lbr = hardwareFeatures.ChildPerfmonLbrSupported != 0;
+#endif
+    return capabilities;
+}
+
+void wsl::windows::common::hcs::ConfigureSmallPageMemory(Memory& Settings, uint32_t FaultClusterSizeShift, uint32_t DirectMapFaultClusterSizeShift)
+{
+    Settings.BackingPageSize = MemoryBackingPageSize::Small;
+    Settings.FaultClusterSizeShift = FaultClusterSizeShift;
+    Settings.DirectMapFaultClusterSizeShift = DirectMapFaultClusterSizeShift;
+}
+
+wsl::windows::common::hcs::Attachment wsl::windows::common::hcs::CreateVhdAttachment(_In_ PCWSTR Path, bool ReadOnly)
+{
+    Attachment attachment{};
+    attachment.Type = AttachmentType::VirtualDisk;
+    attachment.Path = Path;
+    attachment.ReadOnly = ReadOnly;
+    attachment.SupportCompressedVolumes = true;
+    attachment.AlwaysAllowSparseFiles = true;
+    attachment.SupportEncryptedFiles = true;
+    return attachment;
+}
+
+wsl::windows::common::hcs::HvSocket wsl::windows::common::hcs::CreateHvSocketConfiguration(_In_ PSID UserSid)
+{
+    wil::unique_hlocal_string userSidString;
+    THROW_IF_WIN32_BOOL_FALSE(ConvertSidToStringSidW(UserSid, &userSidString));
+    const auto securityDescriptor = std::format(L"D:P(A;;FA;;;SY)(A;;FA;;;{})", userSidString.get());
+    HvSocket settings{};
+    settings.HvSocketConfig.DefaultBindSecurityDescriptor = securityDescriptor;
+    settings.HvSocketConfig.DefaultConnectSecurityDescriptor = securityDescriptor;
+    return settings;
+}
+
 void wsl::windows::common::hcs::AddPlan9Share(
     _In_ HCS_SYSTEM ComputeSystem, _In_ PCWSTR Name, _In_ PCWSTR AccessName, _In_ PCWSTR Path, _In_ UINT32 Port, _In_ Plan9ShareFlags Flags, _In_opt_ HANDLE UserToken)
 {
@@ -58,12 +111,7 @@ void wsl::windows::common::hcs::AddVhd(_In_ HCS_SYSTEM ComputeSystem, _In_ PCWST
     ModifySettingRequest<Attachment> request{};
     request.RequestType = ModifyRequestType::Add;
     request.ResourcePath = c_scsiResourcePath + std::to_wstring(Lun);
-    request.Settings.Path = VhdPath;
-    request.Settings.ReadOnly = ReadOnly;
-    request.Settings.Type = AttachmentType::VirtualDisk;
-    request.Settings.SupportCompressedVolumes = true;
-    request.Settings.AlwaysAllowSparseFiles = true;
-    request.Settings.SupportEncryptedFiles = true;
+    request.Settings = CreateVhdAttachment(VhdPath, ReadOnly);
 
     ModifyComputeSystem(ComputeSystem, wsl::shared::ToJsonW(request).c_str());
 }

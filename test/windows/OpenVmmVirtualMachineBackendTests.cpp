@@ -137,6 +137,14 @@ class OpenVmmVirtualMachineBackendTests
         VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
     }
 
+    TEST_METHOD(RejectsUnsupportedCreationControls)
+    {
+        SKIP_TEST_ARM64();
+        auto request = CreateRequest();
+        request.Boot.UefiRootPath = L"C:\\images";
+        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+    }
+
     TEST_METHOD(EnforcesDiskLimitsAndKeepsIdsVmScoped)
     {
         SKIP_TEST_ARM64();

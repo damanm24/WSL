@@ -64,10 +64,12 @@ add_library(virtualmachinebackend STATIC
     IVirtualMachineBackend.cpp
     IVirtualMachineBackend.h
     OpenVmmVirtualMachineBackend.cpp
-    OpenVmmVirtualMachineBackend.h)
+    OpenVmmVirtualMachineBackend.h
+    HcsVirtualMachineBackend.cpp
+    HcsVirtualMachineBackend.h)
 target_include_directories(virtualmachinebackend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_precompile_headers(virtualmachinebackend REUSE_FROM common)
-target_link_libraries(virtualmachinebackend PUBLIC common ${COMMON_LINK_LIBRARIES} wslopenvmm_client)
+target_link_libraries(virtualmachinebackend PUBLIC common ${COMMON_LINK_LIBRARIES} ${HCS_LINK_LIBRARIES} wslopenvmm_client)
 set_target_properties(virtualmachinebackend PROPERTIES FOLDER windows)
 
 add_executable(wslservice ${SOURCES} ${HEADERS})

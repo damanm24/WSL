@@ -127,6 +127,7 @@ VmDescription wsl::windows::common::vm::openvmm::ValidateCreateRequest(const VmC
         Request.Boot.Method != VmBootMethod::Automatic && Request.Boot.Method != VmBootMethod::LinuxDirect &&
             Request.Boot.Method != VmBootMethod::Uefi);
     THROW_HR_IF(c_notSupported, Request.Boot.Method == VmBootMethod::Uefi);
+    THROW_HR_IF(c_notSupported, Request.Boot.UefiRootPath.has_value());
 
     VmDescription description;
     description.Identity = Request.Identity;

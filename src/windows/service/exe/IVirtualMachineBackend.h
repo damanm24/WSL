@@ -217,11 +217,14 @@ enum class VmBootMethod
 
 struct VmLinuxBootRequest
 {
+    // Paths must already be accessible to the VM host. For UEFI, both files must be under
+    // UefiRootPath (the kernel directory by default); the caller supplies the root-relative initrd= argument.
     std::filesystem::path KernelPath;
     std::filesystem::path InitrdPath;
     VmBootMethod Method = VmBootMethod::Automatic;
     // Passed verbatim to direct boot or UEFI OptionalData; no guest/product arguments are appended.
     std::wstring KernelCommandLine;
+    std::optional<std::filesystem::path> UefiRootPath;
 };
 
 enum class VmConsoleRole
@@ -315,6 +318,7 @@ struct VmCreateRequest
     // HCS uses UserToken to restrict host access to the VM's sockets.
     // The caller prepares backing files and any VM access grants before creation.
     VmInstanceId Identity;
+    std::wstring Owner = L"VirtualMachine";
     VmProcessorRequest Processor;
     VmMemoryRequest Memory;
     VmLinuxBootRequest Boot;

@@ -14,7 +14,7 @@ constexpr HRESULT c_notSupported = HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 VmCreateRequest CreateRequest()
 {
     VmCreateRequest request;
-    THROW_IF_FAILED(CoCreateGuid(&request.VmId));
+    THROW_IF_FAILED(CoCreateGuid(&request.Identity.VmId));
     request.Processor.Count = 2;
     request.Memory.SizeBytes = 512 * c_mib;
     request.Boot.KernelPath = L"C:\\images\\kernel";
@@ -28,7 +28,7 @@ VmCreateRequest CreateRunnableRequest()
     const auto basePath = wsl::windows::common::wslutil::GetBasePath();
     request.Boot.KernelPath = basePath / L"kernel";
     request.Boot.InitrdPath = basePath / LXSS_VM_MODE_INITRD_NAME;
-    request.Boot.GuestCommandLine = L"panic=-1";
+    request.Boot.KernelCommandLine = L"panic=-1";
     return request;
 }
 
@@ -78,20 +78,19 @@ class OpenVmmVirtualMachineBackendTests
     {
         SKIP_TEST_ARM64();
         auto request = CreateRequest();
-        request.Boot.GuestCommandLine = L"personality=caller console=hvc0";
-        request.Boot.UserCommandLine = L"console=ttyS0 custom=value";
+        request.Boot.KernelCommandLine = L"personality=caller console=hvc0 console=ttyS0 custom=value";
         request.BootDisks.push_back(CreateDisk(L"arbitrary-key"));
         request.BootDisks[0].Disk.ReadOnly = false;
         const auto description = ValidateCreateRequest(request);
 
-        VERIFY_IS_TRUE(IsEqualGUID(request.VmId, description.Identity.VmId));
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, description.Identity.VmId));
         VERIFY_ARE_EQUAL(request.Processor.Count, description.Processor.Count);
         VERIFY_ARE_EQUAL(request.Memory.SizeBytes, description.Memory.SizeBytes);
         VERIFY_ARE_EQUAL(VmBootMethod::LinuxDirect, description.Boot.Method);
-        VERIFY_ARE_EQUAL(request.Boot.GuestCommandLine + L" " + request.Boot.UserCommandLine, description.Boot.KernelCommandLine);
+        VERIFY_ARE_EQUAL(request.Boot.KernelCommandLine, description.Boot.KernelCommandLine);
         VERIFY_ARE_EQUAL(size_t{1}, description.BootDisks.size());
         const auto& disk = description.BootDisks.at(L"arbitrary-key");
-        VERIFY_IS_TRUE(IsEqualGUID(request.VmId, disk.Id.Owner.VmId));
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, disk.Id.Owner.VmId));
         VERIFY_ARE_EQUAL(UINT64{1}, disk.Id.Value);
         VERIFY_ARE_EQUAL(UINT32{0}, disk.GuestAddress.Lun);
         VERIFY_IS_FALSE(disk.ReadOnly);
@@ -126,7 +125,7 @@ class OpenVmmVirtualMachineBackendTests
         request.Memory.SizeBytes = 33 * c_mib;
         VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
         request.Memory.SizeBytes = c_mib;
-        VERIFY_ARE_EQUAL(c_notSupported, DescribeResult(request));
+        VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
     }
 
     TEST_METHOD(RejectsInvalidDiskFormats)
@@ -148,7 +147,7 @@ class OpenVmmVirtualMachineBackendTests
         }
         const auto first = ValidateCreateRequest(request);
         VERIFY_ARE_EQUAL(UINT32{253}, first.BootDisks.at(L"253").GuestAddress.Lun);
-        THROW_IF_FAILED(CoCreateGuid(&request.VmId));
+        THROW_IF_FAILED(CoCreateGuid(&request.Identity.VmId));
         const auto second = ValidateCreateRequest(request);
         VERIFY_ARE_EQUAL(first.BootDisks.at(L"0").Id.Value, second.BootDisks.at(L"0").Id.Value);
         VERIFY_IS_FALSE(IsEqualGUID(first.BootDisks.at(L"0").Id.Owner.VmId, second.BootDisks.at(L"0").Id.Owner.VmId));
@@ -175,9 +174,9 @@ class OpenVmmVirtualMachineBackendTests
     {
         SKIP_TEST_ARM64();
         auto request = CreateRequest();
-        request.VmId = GUID_NULL;
+        request.Identity.VmId = GUID_NULL;
         VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
-        THROW_IF_FAILED(CoCreateGuid(&request.VmId));
+        THROW_IF_FAILED(CoCreateGuid(&request.Identity.VmId));
         request.Boot.KernelPath = L"relative-kernel";
         VERIFY_ARE_EQUAL(E_INVALIDARG, DescribeResult(request));
         request.Boot.KernelPath = L"C:\\images\\kernel";
@@ -220,7 +219,7 @@ class OpenVmmVirtualMachineBackendTests
         VERIFY_ARE_EQUAL(c_notSupported, OperationResult([&] { backend->CreateFileSystemDevice(fileSystemRequest); }));
         fileSystemRequest.Transport.Layout = VmVirtioFsLayout::SingleShare;
         const auto fileSystemDevice = backend->CreateFileSystemDevice(fileSystemRequest);
-        VERIFY_IS_TRUE(IsEqualGUID(request.VmId, fileSystemDevice.Id.Owner.VmId));
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, fileSystemDevice.Id.Owner.VmId));
         VERIFY_ARE_EQUAL(VmFileSystemDeviceState::Prepared, fileSystemDevice.State);
         VERIFY_ARE_EQUAL(
             HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), OperationResult([&] { backend->CreateFileSystemDevice(fileSystemRequest); }));
@@ -231,7 +230,7 @@ class OpenVmmVirtualMachineBackendTests
         VERIFY_ARE_EQUAL(c_notSupported, OperationResult([&] { backend->AddFileSystemShare(fileSystemDevice.Id, shareRequest); }));
         shareRequest.Options.MountOptions.clear();
         const auto share = backend->AddFileSystemShare(fileSystemDevice.Id, shareRequest);
-        VERIFY_IS_TRUE(IsEqualGUID(request.VmId, share.Id.Owner.VmId));
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, share.Id.Owner.VmId));
         VERIFY_ARE_EQUAL(fileSystemDevice.Id.Value, share.Device.Value);
         VERIFY_ARE_EQUAL(fileSystemRequest.Transport.Tag, share.GuestAddress.Tag);
         VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), OperationResult([&] {
@@ -253,7 +252,7 @@ class OpenVmmVirtualMachineBackendTests
         networkRequest.Configuration.GatewayIpv4.Bytes = {192, 168, 127, 1};
         networkRequest.Configuration.Netmask.Bytes = {255, 255, 255, 0};
         const auto network = backend->AddNetworkAdapter(networkRequest);
-        VERIFY_IS_TRUE(IsEqualGUID(request.VmId, network.Id.Owner.VmId));
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, network.Id.Owner.VmId));
         VERIFY_IS_TRUE(network.GuestInstanceId.has_value());
         VERIFY_ARE_EQUAL(networkRequest.Tag, network.Tag);
         VERIFY_ARE_EQUAL(
@@ -264,7 +263,7 @@ class OpenVmmVirtualMachineBackendTests
         bindingRequest.Listen.Port = ReserveTcpPort();
         bindingRequest.GuestPort = 80;
         const auto binding = backend->BindPort(network.Id, bindingRequest);
-        VERIFY_IS_TRUE(IsEqualGUID(request.VmId, binding.Id.Owner.VmId));
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, binding.Id.Owner.VmId));
         VERIFY_ARE_EQUAL(network.Id.Value, binding.Device.Value);
         VERIFY_ARE_EQUAL(bindingRequest.Listen.Port, binding.EffectiveListen.Port);
         VERIFY_ARE_EQUAL(

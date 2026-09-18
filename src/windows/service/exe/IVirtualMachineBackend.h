@@ -26,6 +26,7 @@ enum class BackendKind
 struct VmInstanceId
 {
     GUID VmId{};
+    wil::shared_handle UserToken{};
 };
 
 template <typename Tag>
@@ -219,9 +220,8 @@ struct VmLinuxBootRequest
     std::filesystem::path KernelPath;
     std::filesystem::path InitrdPath;
     VmBootMethod Method = VmBootMethod::Automatic;
-    std::wstring GuestCommandLine;
-    std::wstring UserCommandLine;
-    std::optional<std::uint64_t> RequestedDmaBounceBufferBytes;
+    // Passed verbatim to direct boot or UEFI OptionalData; no guest/product arguments are appended.
+    std::wstring KernelCommandLine;
 };
 
 enum class VmConsoleRole
@@ -312,7 +312,9 @@ struct VmCrashCaptureRequest
 
 struct VmCreateRequest
 {
-    GUID VmId{};
+    // HCS uses UserToken to restrict host access to the VM's sockets.
+    // The caller prepares backing files and any VM access grants before creation.
+    VmInstanceId Identity;
     VmProcessorRequest Processor;
     VmMemoryRequest Memory;
     VmLinuxBootRequest Boot;
@@ -343,7 +345,6 @@ struct VmEffectiveBoot
 {
     VmBootMethod Method = VmBootMethod::Automatic;
     std::wstring KernelCommandLine;
-    std::optional<std::uint32_t> PageReportingOrder;
     std::vector<VmConsoleRequest> Consoles;
 };
 

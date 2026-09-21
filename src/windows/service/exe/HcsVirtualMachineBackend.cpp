@@ -2,6 +2,7 @@
 
 #include "precomp.h"
 #include "HcsVirtualMachineBackend.h"
+#include "GuestDeviceManager.h"
 #include "disk.hpp"
 #include "hvsocket.hpp"
 #include "retryshared.h"
@@ -321,6 +322,25 @@ HcsVirtualMachineBackend::HcsVirtualMachineBackend() : m_state(std::make_unique<
 
 HcsVirtualMachineBackend::~HcsVirtualMachineBackend() noexcept = default;
 
+HcsVirtualMachineBackend::State::~State() noexcept
+{
+    CloseFileSystemDevices();
+}
+
+void HcsVirtualMachineBackend::State::CloseFileSystemDevices() noexcept
+{
+    // Device hosts must be shut down while the compute system and callback context still exist.
+    for (const auto& [id, device] : m_fileSystemDevices)
+    {
+        if (const auto* plan9 = std::get_if<Plan9Device>(&device.Resource))
+        {
+            LOG_IF_FAILED(plan9->Server->Teardown());
+        }
+    }
+    m_guestDeviceManager.reset();
+    m_fileSystemDevices.clear();
+}
+
 std::unique_ptr<HcsVirtualMachineBackend> HcsVirtualMachineBackend::Create(const VmCreateRequest& Request)
 {
     auto backend = std::unique_ptr<HcsVirtualMachineBackend>{new HcsVirtualMachineBackend{}};
@@ -380,6 +400,7 @@ void HcsVirtualMachineBackend::Terminate()
     auto lock = m_state->m_lock.lock_exclusive();
     THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system);
     schema::TerminateComputeSystem(m_state->m_system.get());
+    m_state->CloseFileSystemDevices();
     m_state->m_system.reset();
     CloseGuestListeners();
     // A system terminated before Start may not send an exit notification.
@@ -603,7 +624,124 @@ void HcsVirtualMachineBackend::DetachDisk(VmDiskId Disk)
 
 VmFileSystemDevice HcsVirtualMachineBackend::CreateFileSystemDevice(const VmFileSystemDeviceRequest& Request)
 {
-    THROW_HR(E_NOTIMPL);
+    const auto* virtioFs = std::get_if<VmVirtioFsDevice>(&Request.Transport);
+    const auto* plan9Socket = std::get_if<VmPlan9SocketDevice>(&Request.Transport);
+    const auto* plan9Virtio = std::get_if<VmPlan9VirtioDevice>(&Request.Transport);
+    if (std::holds_alternative<VmVirtioFsDevice>(Request.Transport))
+    {
+        validation::ValidateName(virtioFs->Tag, L"HCS virtio-fs tag");
+        THROW_HR_IF(E_INVALIDARG, virtioFs->Layout != VmVirtioFsLayout::SingleShare && virtioFs->Layout != VmVirtioFsLayout::Aggregate);
+    }
+    else if (std::holds_alternative<VmPlan9SocketDevice>(Request.Transport))
+    {
+        THROW_HR_IF(E_INVALIDARG, plan9Socket->Port.Value == 0);
+    }
+    else
+    {
+        THROW_HR_IF(E_INVALIDARG, plan9Virtio == nullptr);
+        validation::ValidateName(plan9Virtio->Tag, L"HCS Plan9 virtio tag");
+    }
+
+    auto lock = m_state->m_lock.lock_exclusive();
+    THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_state->m_system || m_state->m_terminatingEvent.is_signaled());
+    THROW_HR_IF(E_BOUNDS, m_state->m_nextDeviceId == UINT64_MAX);
+    for (const auto& [id, existing] : m_state->m_fileSystemDevices)
+    {
+        bool duplicate = false;
+        if (virtioFs != nullptr)
+        {
+            const auto* transport = std::get_if<VmVirtioFsDevice>(&existing.Request.Transport);
+            duplicate = transport != nullptr && transport->Tag == virtioFs->Tag;
+        }
+        else if (plan9Socket != nullptr)
+        {
+            const auto* transport = std::get_if<VmPlan9SocketDevice>(&existing.Request.Transport);
+            duplicate = transport != nullptr && transport->Port.Value == plan9Socket->Port.Value;
+        }
+        else
+        {
+            const auto* transport = std::get_if<VmPlan9VirtioDevice>(&existing.Request.Transport);
+            duplicate = transport != nullptr && transport->Tag == plan9Virtio->Tag;
+        }
+        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), duplicate);
+    }
+
+    VmFileSystemDevice device{{m_state->m_description.Identity, m_state->m_nextDeviceId}, VmFileSystemDeviceState::Prepared};
+    const auto [entry, inserted] = m_state->m_fileSystemDevices.emplace(device.Id.Value, State::FileSystemDevice{device, Request, {}});
+    WI_ASSERT(inserted);
+    auto rollback = wil::scope_exit([&] { m_state->m_fileSystemDevices.erase(entry); });
+
+    // Single-share virtio-fs needs the host path and options supplied by AddFileSystemShare.
+    if (virtioFs == nullptr || virtioFs->Layout == VmVirtioFsLayout::Aggregate)
+    {
+        const auto runtimeId = schema::GetRuntimeId(m_state->m_system.get());
+        const bool hadDeviceManager = m_state->m_guestDeviceManager != nullptr;
+        auto rollbackManager = wil::scope_exit([&] {
+            if (!hadDeviceManager)
+            {
+                m_state->m_guestDeviceManager.reset();
+            }
+        });
+        if (plan9Socket == nullptr && !m_state->m_guestDeviceManager)
+        {
+            m_state->m_guestDeviceManager = std::make_unique<GuestDeviceManager>(m_state->m_machineId, runtimeId);
+        }
+
+        const auto userToken = m_state->m_description.Identity.UserToken.get();
+        if (virtioFs != nullptr)
+        {
+            entry->second.Resource = m_state->m_guestDeviceManager->AddVirtiofsDevice(
+                virtioFs->Tag.c_str(), L"", L"", userToken, {.Kind = VirtiofsShareKind_Aggregate});
+        }
+        else
+        {
+            wil::com_ptr<IPlan9FileSystem> server;
+            auto teardownOnFailure = wil::scope_exit([&] {
+                if (server)
+                {
+                    LOG_IF_FAILED(server->Teardown());
+                }
+            });
+            bool registered = false;
+            auto unregisterOnFailure = wil::scope_exit([&] {
+                if (registered)
+                {
+                    m_state->m_guestDeviceManager->RemoveRemoteFileSystem(__uuidof(p9fs::Plan9FileSystem), plan9Virtio->Tag);
+                }
+            });
+            {
+                auto revert = wil::impersonate_token(userToken);
+                server = wsl::windows::common::wslutil::CreateComServerAsUser<p9fs::Plan9FileSystem, IPlan9FileSystem>(userToken);
+                if (plan9Socket != nullptr)
+                {
+                    THROW_IF_FAILED(server->Init(&runtimeId, plan9Socket->Port.Value));
+                    THROW_IF_FAILED(server->Resume());
+                    entry->second.Resource = State::Plan9Device{server, {}};
+                }
+                else
+                {
+                    m_state->m_guestDeviceManager->AddRemoteFileSystem(__uuidof(p9fs::Plan9FileSystem), plan9Virtio->Tag.c_str(), server);
+                    registered = true;
+                }
+            }
+            if (plan9Virtio != nullptr)
+            {
+                // The initial device needs host privileges; subsequent mounts use NotifyAllDevicesInUse.
+                const auto instanceId =
+                    m_state->m_guestDeviceManager->AddNewDevice(VIRTIO_PLAN9_DEVICE_ID, server, plan9Virtio->Tag.c_str());
+                entry->second.Resource = State::Plan9Device{server, instanceId};
+            }
+            unregisterOnFailure.release();
+            teardownOnFailure.release();
+        }
+        rollbackManager.release();
+        device.State = VmFileSystemDeviceState::Serving;
+        entry->second.Device.State = device.State;
+    }
+
+    ++m_state->m_nextDeviceId;
+    rollback.release();
+    return device;
 }
 
 VmFileSystemShare HcsVirtualMachineBackend::AddFileSystemShare(VmDeviceId Device, const VmFileSystemShareRequest& Request)

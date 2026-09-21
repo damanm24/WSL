@@ -246,9 +246,9 @@ class OpenVmmVirtualMachineBackendTests
         auto removeShareDirectory = wil::scope_exit([&] { LOG_IF_WIN32_BOOL_FALSE(RemoveDirectoryW(sharePath.c_str())); });
 
         auto backend = OpenVmmVirtualMachineBackend::Create(request);
-        VmFileSystemDeviceRequest fileSystemRequest{{L"test-share", VmVirtioFsLayout::Aggregate}};
+        VmFileSystemDeviceRequest fileSystemRequest{VmVirtioFsDevice{L"test-share", VmVirtioFsLayout::Aggregate}};
         VERIFY_ARE_EQUAL(c_notSupported, OperationResult([&] { backend->CreateFileSystemDevice(fileSystemRequest); }));
-        fileSystemRequest.Transport.Layout = VmVirtioFsLayout::SingleShare;
+        std::get<VmVirtioFsDevice>(fileSystemRequest.Transport).Layout = VmVirtioFsLayout::SingleShare;
         const auto fileSystemDevice = backend->CreateFileSystemDevice(fileSystemRequest);
         VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, fileSystemDevice.Id.Owner.VmId));
         VERIFY_ARE_EQUAL(VmFileSystemDeviceState::Prepared, fileSystemDevice.State);
@@ -257,13 +257,14 @@ class OpenVmmVirtualMachineBackendTests
 
         VmFileSystemShareRequest shareRequest;
         shareRequest.HostPath = sharePath;
-        shareRequest.Options.MountOptions.emplace(L"unsupported", L"");
+        std::get<VmVirtioFsShareOptions>(shareRequest.Options).MountOptions.emplace(L"unsupported", L"");
         VERIFY_ARE_EQUAL(c_notSupported, OperationResult([&] { backend->AddFileSystemShare(fileSystemDevice.Id, shareRequest); }));
-        shareRequest.Options.MountOptions.clear();
+        std::get<VmVirtioFsShareOptions>(shareRequest.Options).MountOptions.clear();
         const auto share = backend->AddFileSystemShare(fileSystemDevice.Id, shareRequest);
         VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, share.Id.Owner.VmId));
         VERIFY_ARE_EQUAL(fileSystemDevice.Id.Value, share.Device.Value);
-        VERIFY_ARE_EQUAL(fileSystemRequest.Transport.Tag, share.GuestAddress.Tag);
+        VERIFY_ARE_EQUAL(
+            std::get<VmVirtioFsDevice>(fileSystemRequest.Transport).Tag, std::get<VmVirtioFsShareAddress>(share.GuestAddress).Tag);
         VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), OperationResult([&] {
                              backend->AddFileSystemShare(fileSystemDevice.Id, shareRequest);
                          }));
@@ -306,6 +307,23 @@ class OpenVmmVirtualMachineBackendTests
         backend->UnbindPort(binding.Id);
         VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), OperationResult([&] { backend->UnbindPort(binding.Id); }));
 
+        backend->Terminate();
+    }
+
+    TEST_METHOD(RejectsPlan9WithoutReservingFileSystemResources)
+    {
+        SKIP_TEST_ARM64();
+        auto backend = OpenVmmVirtualMachineBackend::Create(CreateRunnableRequest());
+        VERIFY_ARE_EQUAL(c_notSupported, OperationResult([&] { backend->CreateFileSystemDevice({VmPlan9SocketDevice{{50000}}}); }));
+        VERIFY_ARE_EQUAL(
+            c_notSupported, OperationResult([&] { backend->CreateFileSystemDevice({VmPlan9VirtioDevice{L"test-share"}}); }));
+        const auto device = backend->CreateFileSystemDevice({VmVirtioFsDevice{L"test-share", VmVirtioFsLayout::SingleShare}});
+        VERIFY_ARE_EQUAL(UINT64{1}, device.Id.Value);
+        VERIFY_ARE_EQUAL(VmFileSystemDeviceState::Prepared, device.State);
+
+        VmFileSystemShareRequest share;
+        share.Options = VmPlan9ShareOptions{L"access"};
+        VERIFY_ARE_EQUAL(c_notSupported, OperationResult([&] { backend->AddFileSystemShare(device.Id, share); }));
         backend->Terminate();
     }
 

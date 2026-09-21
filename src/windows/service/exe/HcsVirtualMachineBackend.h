@@ -5,6 +5,9 @@
 #include "IVirtualMachineBackend.h"
 #include "hcs.hpp"
 
+class GuestDeviceManager;
+struct IPlan9FileSystem;
+
 namespace wsl::windows::common::vm::hcs {
 
 struct VmConfiguration
@@ -58,6 +61,23 @@ private:
 
     struct State
     {
+        ~State() noexcept;
+        void CloseFileSystemDevices() noexcept;
+
+        struct Plan9Device
+        {
+            wil::com_ptr<IPlan9FileSystem> Server;
+            std::optional<GUID> InstanceId;
+        };
+
+        struct FileSystemDevice
+        {
+            VmFileSystemDevice Device;
+            VmFileSystemDeviceRequest Request;
+            // Prepared virtio-fs, physical virtio-fs device, or owned Plan9 server.
+            std::variant<std::monostate, GUID, Plan9Device> Resource;
+        };
+
         struct AttachedDisk
         {
             VmDiskAttachment Attachment;
@@ -79,6 +99,9 @@ private:
         _Guarded_by_(m_lock) std::uint64_t m_nextDiskId = 1;
         // Closing the system drains callbacks before their event and context are destroyed.
         _Guarded_by_(m_lock) wsl::windows::common::hcs::unique_hcs_system m_system;
+        _Guarded_by_(m_lock) std::unique_ptr<GuestDeviceManager> m_guestDeviceManager;
+        _Guarded_by_(m_lock) std::map<std::uint64_t, FileSystemDevice> m_fileSystemDevices;
+        _Guarded_by_(m_lock) std::uint64_t m_nextDeviceId = 1;
     };
 
     std::unique_ptr<State> m_state;

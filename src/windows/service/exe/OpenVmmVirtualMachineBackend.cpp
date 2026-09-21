@@ -651,10 +651,12 @@ void OpenVmmVirtualMachineBackend::DetachDisk(VmDiskId Disk)
 
 VmFileSystemDevice OpenVmmVirtualMachineBackend::CreateFileSystemDevice(const VmFileSystemDeviceRequest& Request)
 {
-    validation::ValidateName(Request.Transport.Tag, L"OpenVMM virtio-fs tag");
+    const auto* transport = std::get_if<VmVirtioFsDevice>(&Request.Transport);
+    THROW_HR_IF_MSG(c_notSupported, transport == nullptr, "OpenVMM does not support Plan9 devices");
+    validation::ValidateName(transport->Tag, L"OpenVMM virtio-fs tag");
     THROW_HR_IF_MSG(
         c_notSupported,
-        Request.Transport.Layout != VmVirtioFsLayout::SingleShare,
+        transport->Layout != VmVirtioFsLayout::SingleShare,
         "OpenVMM currently supports only single-share virtio-fs devices");
 
     auto lock = m_state->m_lock.lock_exclusive();
@@ -662,13 +664,11 @@ VmFileSystemDevice OpenVmmVirtualMachineBackend::CreateFileSystemDevice(const Vm
     THROW_HR_IF(E_BOUNDS, m_state->m_nextDeviceId == UINT64_MAX);
     for (const auto& entry : m_state->m_fileSystemDevices)
     {
-        THROW_HR_IF(
-            HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), wsl::shared::string::IsEqual(entry.second.Transport.Tag, Request.Transport.Tag, false));
+        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), wsl::shared::string::IsEqual(entry.second.Transport.Tag, transport->Tag, false));
     }
 
     VmFileSystemDevice device{{m_state->m_description.Identity, m_state->m_nextDeviceId}, VmFileSystemDeviceState::Prepared};
-    const auto inserted =
-        m_state->m_fileSystemDevices.emplace(device.Id.Value, State::FileSystemDevice{device, Request.Transport, {}}).second;
+    const auto inserted = m_state->m_fileSystemDevices.emplace(device.Id.Value, State::FileSystemDevice{device, *transport, {}}).second;
     WI_ASSERT(inserted);
     ++m_state->m_nextDeviceId;
     return device;
@@ -676,11 +676,13 @@ VmFileSystemDevice OpenVmmVirtualMachineBackend::CreateFileSystemDevice(const Vm
 
 VmFileSystemShare OpenVmmVirtualMachineBackend::AddFileSystemShare(VmDeviceId Device, const VmFileSystemShareRequest& Request)
 {
+    const auto* options = std::get_if<VmVirtioFsShareOptions>(&Request.Options);
+    THROW_HR_IF_MSG(c_notSupported, options == nullptr, "OpenVMM does not support Plan9 shares");
     validation::ValidateResourceId(Device, m_state->m_description.Identity);
     validation::ValidatePath(Request.HostPath, L"OpenVMM");
     THROW_HR_IF_MSG(
         E_INVALIDARG, !Request.Name.empty(), "A single-share OpenVMM virtio-fs device does not accept a child share name");
-    THROW_HR_IF_MSG(c_notSupported, !Request.Options.MountOptions.empty(), "OpenVMM does not support virtio-fs mount options");
+    THROW_HR_IF_MSG(c_notSupported, !options->MountOptions.empty(), "OpenVMM does not support virtio-fs mount options");
     const auto hostPath = wsl::windows::common::filesystem::GetCanonicalPath(Request.HostPath);
     const auto attributes = GetFileAttributesW(hostPath.c_str());
     THROW_LAST_ERROR_IF(attributes == INVALID_FILE_ATTRIBUTES);
@@ -695,7 +697,11 @@ VmFileSystemShare OpenVmmVirtualMachineBackend::AddFileSystemShare(VmDeviceId De
     THROW_HR_IF(E_BOUNDS, m_state->m_nextShareId == UINT64_MAX);
 
     VmFileSystemShare share{
-        {m_state->m_description.Identity, m_state->m_nextShareId}, Device, {device->second.Transport.Tag, {}}, hostPath, Request.ReadOnly};
+        {m_state->m_description.Identity, m_state->m_nextShareId},
+        Device,
+        VmVirtioFsShareAddress{device->second.Transport.Tag, {}},
+        hostPath,
+        Request.ReadOnly};
     const auto [entry, inserted] = m_state->m_fileSystemShares.emplace(share.Id.Value, State::FileSystemShare{share});
     WI_ASSERT(inserted);
     device->second.Share = share.Id.Value;
@@ -705,7 +711,7 @@ VmFileSystemShare OpenVmmVirtualMachineBackend::AddFileSystemShare(VmDeviceId De
         device->second.Device.State = VmFileSystemDeviceState::Prepared;
         m_state->m_fileSystemShares.erase(entry);
     });
-    THROW_IF_FAILED(WslOpenVmmVmAddShare(m_state->m_vm.get(), share.GuestAddress.Tag.c_str(), hostPath.c_str(), Request.ReadOnly));
+    THROW_IF_FAILED(WslOpenVmmVmAddShare(m_state->m_vm.get(), device->second.Transport.Tag.c_str(), hostPath.c_str(), Request.ReadOnly));
     ++m_state->m_nextShareId;
     rollback.release();
     return share;
@@ -721,7 +727,7 @@ void OpenVmmVirtualMachineBackend::RemoveFileSystemShare(VmShareId Share)
     const auto device = m_state->m_fileSystemDevices.find(share->second.Share.Device.Value);
     THROW_HR_IF(E_UNEXPECTED, device == m_state->m_fileSystemDevices.end() || device->second.Share != Share.Value);
 
-    THROW_IF_FAILED(WslOpenVmmVmRemoveShare(m_state->m_vm.get(), share->second.Share.GuestAddress.Tag.c_str()));
+    THROW_IF_FAILED(WslOpenVmmVmRemoveShare(m_state->m_vm.get(), device->second.Transport.Tag.c_str()));
     device->second.Share.reset();
     device->second.Device.State = VmFileSystemDeviceState::Prepared;
     m_state->m_fileSystemShares.erase(share);

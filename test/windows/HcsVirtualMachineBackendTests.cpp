@@ -62,6 +62,128 @@ class HcsVirtualMachineBackendTests
 {
     WSL_TEST_CLASS(HcsVirtualMachineBackendTests)
 
+    TEST_METHOD(FileSystemRequestsDefaultToVirtioFs)
+    {
+        const VmFileSystemDeviceRequest device;
+        VERIFY_IS_TRUE(std::holds_alternative<VmVirtioFsDevice>(device.Transport));
+        VERIFY_ARE_EQUAL(VmVirtioFsLayout::Aggregate, std::get<VmVirtioFsDevice>(device.Transport).Layout);
+        const VmFileSystemShareRequest share;
+        VERIFY_IS_TRUE(std::holds_alternative<VmVirtioFsShareOptions>(share.Options));
+        VERIFY_IS_TRUE(std::get<VmVirtioFsShareOptions>(share.Options).MountOptions.empty());
+        VERIFY_IS_TRUE(share.ReadOnly);
+        const VmFileSystemShare result;
+        VERIFY_IS_TRUE(std::holds_alternative<VmVirtioFsShareAddress>(result.GuestAddress));
+    }
+
+    WSL2_TEST_METHOD(PreparesFileSystemDevicesWithoutSharingHostPaths)
+    {
+        const auto request = CreateRunnableRequest();
+        auto backend = HcsVirtualMachineBackend::Create(request);
+        for (const auto& invalid :
+             {VmFileSystemDeviceRequest{},
+              VmFileSystemDeviceRequest{VmVirtioFsDevice{L"tag", static_cast<VmVirtioFsLayout>(-1)}},
+              VmFileSystemDeviceRequest{VmVirtioFsDevice{std::wstring{L"bad\0tag", 7}}},
+              VmFileSystemDeviceRequest{VmPlan9SocketDevice{}},
+              VmFileSystemDeviceRequest{VmPlan9VirtioDevice{}},
+              VmFileSystemDeviceRequest{VmPlan9VirtioDevice{std::wstring{L"bad\0tag", 7}}}})
+        {
+            VERIFY_ARE_EQUAL(E_INVALIDARG, wil::ResultFromException([&] { backend->CreateFileSystemDevice(invalid); }));
+        }
+
+        const VmFileSystemDeviceRequest deviceRequest{VmVirtioFsDevice{L"reserved", VmVirtioFsLayout::SingleShare}};
+        const auto device = backend->CreateFileSystemDevice(deviceRequest);
+        VERIFY_ARE_EQUAL(UINT64{1}, device.Id.Value);
+        VERIFY_ARE_EQUAL(VmFileSystemDeviceState::Prepared, device.State);
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, device.Id.Owner.VmId));
+        VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), wil::ResultFromException([&] {
+                             backend->CreateFileSystemDevice(deviceRequest);
+                         }));
+        VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), wil::ResultFromException([&] {
+                             backend->CreateFileSystemDevice({VmVirtioFsDevice{L"reserved", VmVirtioFsLayout::Aggregate}});
+                         }));
+        const auto second = backend->CreateFileSystemDevice({VmVirtioFsDevice{L"second", VmVirtioFsLayout::SingleShare}});
+        VERIFY_ARE_NOT_EQUAL(device.Id.Value, second.Id.Value);
+
+        auto other = HcsVirtualMachineBackend::Create(CreateRunnableRequest());
+        const auto isolated = other->CreateFileSystemDevice(deviceRequest);
+        VERIFY_ARE_EQUAL(UINT64{1}, isolated.Id.Value);
+        VERIFY_IS_FALSE(IsEqualGUID(device.Id.Owner.VmId, isolated.Id.Owner.VmId));
+        other->Terminate();
+        backend->Terminate();
+        VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), wil::ResultFromException([&] {
+                             backend->CreateFileSystemDevice(deviceRequest);
+                         }));
+    }
+
+    WSL2_TEST_METHOD(CreatesPlan9SocketDevicesWithoutShares)
+    {
+        auto request = CreateRunnableRequest();
+        wil::unique_handle token;
+        THROW_IF_WIN32_BOOL_FALSE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, token.put()));
+        request.Identity.UserToken = wil::shared_handle{token.release()};
+        auto backend = HcsVirtualMachineBackend::Create(request);
+        backend->Start();
+        const VmFileSystemDeviceRequest deviceRequest{VmPlan9SocketDevice{{50000}}};
+        const auto device = backend->CreateFileSystemDevice(deviceRequest);
+        VERIFY_ARE_EQUAL(VmFileSystemDeviceState::Serving, device.State);
+        VERIFY_IS_TRUE(IsEqualGUID(request.Identity.VmId, device.Id.Owner.VmId));
+        VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), wil::ResultFromException([&] {
+                             backend->CreateFileSystemDevice(deviceRequest);
+                         }));
+        const auto second = backend->CreateFileSystemDevice({VmPlan9SocketDevice{{50001}}});
+        VERIFY_ARE_NOT_EQUAL(device.Id.Value, second.Id.Value);
+
+        THROW_IF_FAILED(CoCreateGuid(&request.Identity.VmId));
+        auto other = HcsVirtualMachineBackend::Create(request);
+        other->Start();
+        VERIFY_ARE_EQUAL(VmFileSystemDeviceState::Serving, other->CreateFileSystemDevice(deviceRequest).State);
+        other.reset();
+        backend->Terminate();
+        VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), wil::ResultFromException([&] {
+                             backend->CreateFileSystemDevice(deviceRequest);
+                         }));
+    }
+
+    WSL2_TEST_METHOD(CreatesAggregateVirtioFsAndPlan9VirtioDevicesWithoutShares)
+    {
+        WINDOWS_11_TEST_ONLY();
+        auto request = CreateRunnableRequest();
+        wil::unique_handle token;
+        THROW_IF_WIN32_BOOL_FALSE(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, token.put()));
+        request.Identity.UserToken = wil::shared_handle{token.release()};
+        auto backend = HcsVirtualMachineBackend::Create(request);
+        backend->Start();
+        const VmFileSystemDeviceRequest aggregate{VmVirtioFsDevice{L"aggregate"}};
+        const VmFileSystemDeviceRequest plan9{VmPlan9VirtioDevice{L"plan9"}};
+        const auto aggregateDevice = backend->CreateFileSystemDevice(aggregate);
+        const auto plan9Device = backend->CreateFileSystemDevice(plan9);
+        VERIFY_ARE_EQUAL(VmFileSystemDeviceState::Serving, aggregateDevice.State);
+        VERIFY_ARE_EQUAL(VmFileSystemDeviceState::Serving, plan9Device.State);
+        VERIFY_ARE_NOT_EQUAL(aggregateDevice.Id.Value, plan9Device.Id.Value);
+        for (const auto& duplicate : {aggregate, plan9})
+        {
+            VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), wil::ResultFromException([&] {
+                                 backend->CreateFileSystemDevice(duplicate);
+                             }));
+        }
+        backend->Terminate();
+    }
+
+    WSL2_TEST_METHOD(FailedPlan9CreationDoesNotReserveThePort)
+    {
+        // CreateRequest deliberately supplies a query-only token, which cannot impersonate.
+        auto backend = HcsVirtualMachineBackend::Create(CreateRunnableRequest());
+        backend->Start();
+        const VmFileSystemDeviceRequest deviceRequest{VmPlan9SocketDevice{{50000}}};
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            VERIFY_ARE_EQUAL(E_ACCESSDENIED, wil::ResultFromException([&] { backend->CreateFileSystemDevice(deviceRequest); }));
+        }
+        const auto device = backend->CreateFileSystemDevice({VmVirtioFsDevice{L"reserved", VmVirtioFsLayout::SingleShare}});
+        VERIFY_ARE_EQUAL(UINT64{1}, device.Id.Value);
+        backend->Terminate();
+    }
+
     WSL2_TEST_METHOD(StartsAndTerminatesWithoutGuestHandshake)
     {
         auto backend = HcsVirtualMachineBackend::Create(CreateRunnableRequest());

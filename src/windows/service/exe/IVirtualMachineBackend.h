@@ -476,9 +476,19 @@ struct VmVirtioFsDevice
     VmVirtioFsLayout Layout = VmVirtioFsLayout::Aggregate;
 };
 
+struct VmPlan9SocketDevice
+{
+    GuestServicePort Port;
+};
+
+struct VmPlan9VirtioDevice
+{
+    std::wstring Tag;
+};
+
 struct VmFileSystemDeviceRequest
 {
-    VmVirtioFsDevice Transport;
+    std::variant<VmVirtioFsDevice, VmPlan9SocketDevice, VmPlan9VirtioDevice> Transport;
 };
 
 enum class VmFileSystemDeviceState
@@ -499,12 +509,23 @@ struct VmVirtioFsShareOptions
     std::map<std::wstring, std::wstring> MountOptions;
 };
 
+struct VmPlan9ShareOptions
+{
+    std::wstring AccessName;
+    bool LinuxMetadata = false;
+    bool CaseSensitive = false;
+    bool UseShareRootIdentity = false;
+    bool AllowMountOptions = false;
+    bool AllowSubPaths = false;
+};
+
 struct VmFileSystemShareRequest
 {
     std::filesystem::path HostPath;
+    // Child name for aggregate virtio-fs devices; Plan9 uses Options.AccessName.
     std::wstring Name;
     bool ReadOnly = true;
-    VmVirtioFsShareOptions Options;
+    std::variant<VmVirtioFsShareOptions, VmPlan9ShareOptions> Options;
 };
 
 struct VmVirtioFsShareAddress
@@ -513,11 +534,23 @@ struct VmVirtioFsShareAddress
     std::optional<std::wstring> ChildName;
 };
 
+struct VmPlan9SocketShareAddress
+{
+    GuestServicePort Port;
+    std::wstring AccessName;
+};
+
+struct VmPlan9VirtioShareAddress
+{
+    std::wstring Tag;
+    std::wstring AccessName;
+};
+
 struct VmFileSystemShare
 {
     VmShareId Id;
     VmDeviceId Device;
-    VmVirtioFsShareAddress GuestAddress;
+    std::variant<VmVirtioFsShareAddress, VmPlan9SocketShareAddress, VmPlan9VirtioShareAddress> GuestAddress;
     std::filesystem::path EffectiveHostPath;
     bool ReadOnly = true;
 };
